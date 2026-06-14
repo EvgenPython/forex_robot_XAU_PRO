@@ -8,6 +8,55 @@ from app.state_manager import (
 )
 from app.logger import log_event, log_trade_event
 
+from app.telegram_notifier import (
+    notify_sl_moved,
+    notify_trade_closed,
+)
+
+
+def safe_notify_sl_moved(
+    symbol: str,
+    direction: str,
+    new_sl: float,
+    reason: str,
+    dry_run: bool,
+):
+    try:
+        notify_sl_moved(
+            symbol=symbol,
+            direction=direction,
+            new_sl=round(float(new_sl), 2),
+            reason=reason,
+            dry_run=dry_run,
+        )
+    except Exception as error:
+        log_event(f"Telegram SL moved notification failed: {error}")
+
+
+def safe_notify_trade_closed(
+    symbol: str,
+    direction: str,
+    reason: str,
+    close_price: float,
+    money_result: float = 0.0,
+    percent_result: float = 0.0,
+    daily_percent: float = 0.0,
+    dry_run: bool = True,
+):
+    try:
+        notify_trade_closed(
+            symbol=symbol,
+            direction=direction,
+            reason=reason,
+            close_price=round(float(close_price), 2),
+            money_result=float(money_result),
+            percent_result=float(percent_result),
+            daily_percent=float(daily_percent),
+            dry_run=dry_run,
+        )
+    except Exception as error:
+        log_event(f"Telegram close trade notification failed: {error}")
+
 
 def get_open_position(symbol: str):
     positions = mt5.positions_get(symbol=symbol)
@@ -107,6 +156,17 @@ def close_position(symbol: str, reason: str = "EXIT_SIGNAL") -> bool:
         comment=reason,
     )
 
+    safe_notify_trade_closed(
+        symbol=symbol,
+        direction=direction,
+        reason=reason,
+        close_price=price,
+        money_result=float(position.profit),
+        percent_result=0.0,
+        daily_percent=0.0,
+        dry_run=False,
+    )
+
     clear_trade()
     return True
 
@@ -141,6 +201,24 @@ def update_candle_counter(trade: dict, current_candle_time: str) -> dict:
     return trade
 
 
+def calculate_dry_run_result(trade: dict, close_price: float) -> tuple[float, float]:
+    entry = float(trade["entry_price"])
+    volume = float(trade["volume"])
+    direction = trade["direction"]
+
+    if direction == "BUY":
+        points_result = close_price - entry
+    elif direction == "SELL":
+        points_result = entry - close_price
+    else:
+        points_result = 0.0
+
+    money_result = points_result * volume
+    percent_result = 0.0
+
+    return money_result, percent_result
+
+
 def move_sl_dry_run(trade: dict, new_sl: float, event: str, comment: str) -> dict:
     trade["stop_loss"] = round(float(new_sl), 2)
 
@@ -160,10 +238,23 @@ def move_sl_dry_run(trade: dict, new_sl: float, event: str, comment: str) -> dic
 
     log_event(f"DRY RUN SL moved: {trade['stop_loss']} | {comment}")
 
+    safe_notify_sl_moved(
+        symbol=trade.get("symbol", ""),
+        direction=trade["direction"],
+        new_sl=trade["stop_loss"],
+        reason=comment,
+        dry_run=True,
+    )
+
     return trade
 
 
 def close_trade_dry_run(trade: dict, current_price: float, reason: str):
+    money_result, percent_result = calculate_dry_run_result(
+        trade=trade,
+        close_price=current_price,
+    )
+
     log_trade_event(
         event="DRY_RUN_CLOSE_POSITION",
         symbol=trade.get("symbol", ""),
@@ -175,10 +266,22 @@ def close_trade_dry_run(trade: dict, current_price: float, reason: str):
         tp3=trade["tp3"],
         volume=trade["volume"],
         ticket=trade.get("ticket", "DRY_RUN"),
+        profit=money_result,
         comment=f"{reason}, close_price={current_price}",
     )
 
     log_event(f"DRY RUN position closed: reason={reason}, price={current_price}")
+
+    safe_notify_trade_closed(
+        symbol=trade.get("symbol", ""),
+        direction=trade["direction"],
+        reason=reason,
+        close_price=current_price,
+        money_result=money_result,
+        percent_result=percent_result,
+        daily_percent=0.0,
+        dry_run=True,
+    )
 
     clear_trade()
 
@@ -225,7 +328,7 @@ def manage_dry_run_position(symbol: str, m15, settings: dict, current_candle_tim
                 trade=trade,
                 new_sl=new_sl,
                 event="TP1_HIT_SL_TO_BE_PLUS",
-                comment="TP1 reached, SL moved to BE+",
+                comment="TP1 достигнут, стоп перенесён в BE+",
             )
 
         if current_price >= tp2 and not trade.get("tp2_hit", False):
@@ -234,7 +337,7 @@ def manage_dry_run_position(symbol: str, m15, settings: dict, current_candle_tim
                 trade=trade,
                 new_sl=tp1,
                 event="TP2_HIT_SL_TO_TP1",
-                comment="TP2 reached, SL moved to TP1",
+                comment="TP2 достигнут, стоп перенесён на TP1",
             )
 
         if current_price >= tp3 and not trade.get("tp3_hit", False):
@@ -243,7 +346,7 @@ def manage_dry_run_position(symbol: str, m15, settings: dict, current_candle_tim
                 trade=trade,
                 new_sl=tp2,
                 event="TP3_HIT_SL_TO_TP2",
-                comment="TP3 reached, SL moved to TP2",
+                comment="TP3 достигнут, стоп перенесён на TP2",
             )
 
     elif direction == "SELL":
@@ -259,7 +362,7 @@ def manage_dry_run_position(symbol: str, m15, settings: dict, current_candle_tim
                 trade=trade,
                 new_sl=new_sl,
                 event="TP1_HIT_SL_TO_BE_PLUS",
-                comment="TP1 reached, SL moved to BE+",
+                comment="TP1 достигнут, стоп перенесён в BE+",
             )
 
         if current_price <= tp2 and not trade.get("tp2_hit", False):
@@ -268,7 +371,7 @@ def manage_dry_run_position(symbol: str, m15, settings: dict, current_candle_tim
                 trade=trade,
                 new_sl=tp1,
                 event="TP2_HIT_SL_TO_TP1",
-                comment="TP2 reached, SL moved to TP1",
+                comment="TP2 достигнут, стоп перенесён на TP1",
             )
 
         if current_price <= tp3 and not trade.get("tp3_hit", False):
@@ -277,7 +380,7 @@ def manage_dry_run_position(symbol: str, m15, settings: dict, current_candle_tim
                 trade=trade,
                 new_sl=tp2,
                 event="TP3_HIT_SL_TO_TP2",
-                comment="TP3 reached, SL moved to TP2",
+                comment="TP3 достигнут, стоп перенесён на TP2",
             )
 
     if should_exit_trade(
@@ -331,15 +434,39 @@ def manage_real_position(symbol: str, m15, settings: dict, current_candle_time: 
                 trade["tp1_hit"] = True
                 trade["breakeven_active"] = True
 
+                safe_notify_sl_moved(
+                    symbol=symbol,
+                    direction=direction,
+                    new_sl=trade["stop_loss"],
+                    reason="TP1 достигнут, стоп перенесён в BE+",
+                    dry_run=False,
+                )
+
         if current_price >= tp2 and not trade.get("tp2_hit", False):
             if modify_stop_loss(position.ticket, symbol, tp1):
                 trade["stop_loss"] = round(float(tp1), 2)
                 trade["tp2_hit"] = True
 
+                safe_notify_sl_moved(
+                    symbol=symbol,
+                    direction=direction,
+                    new_sl=trade["stop_loss"],
+                    reason="TP2 достигнут, стоп перенесён на TP1",
+                    dry_run=False,
+                )
+
         if current_price >= tp3 and not trade.get("tp3_hit", False):
             if modify_stop_loss(position.ticket, symbol, tp2):
                 trade["stop_loss"] = round(float(tp2), 2)
                 trade["tp3_hit"] = True
+
+                safe_notify_sl_moved(
+                    symbol=symbol,
+                    direction=direction,
+                    new_sl=trade["stop_loss"],
+                    reason="TP3 достигнут, стоп перенесён на TP2",
+                    dry_run=False,
+                )
 
     elif direction == "SELL":
         if current_price <= tp1 and not trade.get("tp1_hit", False):
@@ -350,15 +477,39 @@ def manage_real_position(symbol: str, m15, settings: dict, current_candle_time: 
                 trade["tp1_hit"] = True
                 trade["breakeven_active"] = True
 
+                safe_notify_sl_moved(
+                    symbol=symbol,
+                    direction=direction,
+                    new_sl=trade["stop_loss"],
+                    reason="TP1 достигнут, стоп перенесён в BE+",
+                    dry_run=False,
+                )
+
         if current_price <= tp2 and not trade.get("tp2_hit", False):
             if modify_stop_loss(position.ticket, symbol, tp1):
                 trade["stop_loss"] = round(float(tp1), 2)
                 trade["tp2_hit"] = True
 
+                safe_notify_sl_moved(
+                    symbol=symbol,
+                    direction=direction,
+                    new_sl=trade["stop_loss"],
+                    reason="TP2 достигнут, стоп перенесён на TP1",
+                    dry_run=False,
+                )
+
         if current_price <= tp3 and not trade.get("tp3_hit", False):
             if modify_stop_loss(position.ticket, symbol, tp2):
                 trade["stop_loss"] = round(float(tp2), 2)
                 trade["tp3_hit"] = True
+
+                safe_notify_sl_moved(
+                    symbol=symbol,
+                    direction=direction,
+                    new_sl=trade["stop_loss"],
+                    reason="TP3 достигнут, стоп перенесён на TP2",
+                    dry_run=False,
+                )
 
     if should_exit_trade(
         direction=direction,

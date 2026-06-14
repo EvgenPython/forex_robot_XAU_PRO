@@ -65,6 +65,14 @@ def format_percent(value: float) -> str:
     return f"{sign}{value:.2f}%"
 
 
+def format_price(value: float) -> str:
+    return f"{float(value):.2f}"
+
+
+def format_mode(dry_run: bool) -> str:
+    return "DRY RUN" if dry_run else "DEMO / REAL"
+
+
 def notify_open_trade(
     symbol: str,
     direction: str,
@@ -76,7 +84,7 @@ def notify_open_trade(
     score: int,
     dry_run: bool,
 ):
-    mode = "DRY RUN" if dry_run else "DEMO / REAL"
+    mode = format_mode(dry_run)
 
     text = (
         "🟢 <b>Открыт сигнал</b>\n\n"
@@ -84,11 +92,11 @@ def notify_open_trade(
         f"Режим: <b>{mode}</b>\n"
         f"Направление: <b>{direction}</b>\n"
         f"Оценка: <b>{score}</b>\n\n"
-        f"Вход: <b>{entry_price}</b>\n"
-        f"Стоп: <b>{stop_loss}</b>\n\n"
-        f"TP1: <b>{tp1}</b>\n"
-        f"TP2: <b>{tp2}</b>\n\n"
-        f"Объем: <b>{volume}</b>"
+        f"Вход: <b>{format_price(entry_price)}</b>\n"
+        f"Стоп: <b>{format_price(stop_loss)}</b>\n\n"
+        f"TP1: <b>{format_price(tp1)}</b>\n"
+        f"TP2: <b>{format_price(tp2)}</b>\n\n"
+        f"Объём: <b>{volume}</b>"
     )
 
     send_telegram_message(text)
@@ -101,14 +109,14 @@ def notify_sl_moved(
     reason: str,
     dry_run: bool,
 ):
-    mode = "DRY RUN" if dry_run else "DEMO / REAL"
+    mode = format_mode(dry_run)
 
     text = (
         "🛡 <b>Стоп перенесён</b>\n\n"
         f"Инструмент: <b>{symbol}</b>\n"
         f"Режим: <b>{mode}</b>\n"
         f"Направление: <b>{direction}</b>\n\n"
-        f"Новый стоп: <b>{new_sl}</b>\n"
+        f"Новый стоп: <b>{format_price(new_sl)}</b>\n"
         f"Причина: <b>{reason}</b>"
     )
 
@@ -125,7 +133,7 @@ def notify_trade_closed(
     daily_percent: float,
     dry_run: bool,
 ):
-    mode = "DRY RUN" if dry_run else "DEMO / REAL"
+    mode = format_mode(dry_run)
     icon = "✅" if money_result >= 0 else "🔴"
 
     text = (
@@ -133,7 +141,7 @@ def notify_trade_closed(
         f"Инструмент: <b>{symbol}</b>\n"
         f"Режим: <b>{mode}</b>\n"
         f"Направление: <b>{direction}</b>\n\n"
-        f"Цена закрытия: <b>{close_price}</b>\n"
+        f"Цена закрытия: <b>{format_price(close_price)}</b>\n"
         f"Причина: <b>{reason}</b>\n\n"
         f"Результат: <b>{format_money(money_result)}</b>\n"
         f"Результат: <b>{format_percent(percent_result)}</b>\n"

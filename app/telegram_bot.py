@@ -2,14 +2,19 @@ import asyncio
 import json
 from pathlib import Path
 
-import MetaTrader5 as mt5
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from app.mt5_client import connect_mt5, ensure_symbol
+from app.mt5_client import (
+    ensure_mt5_connection,
+    get_account_info,
+    get_symbol_info,
+    get_tick,
+)
+
 from app.state_manager import load_state
 from app.telegram_notifier import load_telegram_config
 
@@ -48,6 +53,7 @@ def main_keyboard():
     kb.button(text="📊 Статус", callback_data="status")
     kb.button(text="💼 Сделка", callback_data="trade")
     kb.button(text="📜 Последний сигнал", callback_data="last_signal")
+    kb.button(text="🖥 Сервер", callback_data="server")
     kb.button(text="⚙️ Робот", callback_data="robot")
 
     kb.adjust(1)
@@ -70,7 +76,13 @@ def format_bool(value: bool) -> str:
 
 
 def get_account_data():
-    account = mt5.account_info()
+    settings = load_settings()
+    symbol = settings.get("symbol", "XAUUSD")
+
+    if not ensure_mt5_connection(symbol=symbol, quiet=True):
+        return None
+
+    account = get_account_info(auto_reconnect=True)
 
     if account is None:
         return None
@@ -113,8 +125,16 @@ def calculate_trade_result(trade: dict) -> dict:
     entry_price = float(trade.get("entry_price", 0))
     volume = float(trade.get("volume", 0))
 
-    tick = mt5.symbol_info_tick(symbol)
-    info = mt5.symbol_info(symbol)
+    if not ensure_mt5_connection(symbol=symbol, quiet=True):
+        return {
+            "price": 0.0,
+            "money": 0.0,
+            "percent": 0.0,
+            "available": False,
+        }
+
+    tick = get_tick(symbol)
+    info = get_symbol_info(symbol)
 
     if tick is None or info is None or entry_price <= 0 or volume <= 0:
         return {
@@ -239,11 +259,11 @@ def build_trade_text() -> str:
         f"Режим: <b>{mode}</b>\n"
         f"Направление: <b>{direction}</b>\n"
         f"Оценка: <b>{score}</b>\n\n"
-        f"Вход: <b>{entry_price}</b>\n"
-        f"Стоп: <b>{stop_loss}</b>\n"
-        f"TP1: <b>{tp1}</b>\n"
-        f"TP2: <b>{tp2}</b>\n\n"
-        f"Объем: <b>{volume}</b>\n"
+        f"Вход: <b>{entry_price:.2f}</b>\n"
+        f"Стоп: <b>{stop_loss:.2f}</b>\n"
+        f"TP1: <b>{tp1:.2f}</b>\n"
+        f"TP2: <b>{tp2:.2f}</b>\n\n"
+        f"Объём: <b>{volume}</b>\n"
         f"Свечей в сделке: <b>{candles_in_trade}</b>\n\n"
         f"TP1 выполнен: <b>{format_bool(tp1_hit)}</b>\n"
         f"TP2 выполнен: <b>{format_bool(tp2_hit)}</b>\n"
@@ -253,7 +273,38 @@ def build_trade_text() -> str:
     )
 
 
+def read_last_signal_from_state() -> str | None:
+    state = load_state()
+    last_signal = state.get("last_signal")
+
+    if not last_signal:
+        return None
+
+    action = last_signal.get("action", "нет данных")
+    score = last_signal.get("score", "нет данных")
+    reasons = last_signal.get("reasons", [])
+    time_value = last_signal.get("time", "нет данных")
+
+    if isinstance(reasons, list):
+        reasons_text = "\n".join([f"- {reason}" for reason in reasons])
+    else:
+        reasons_text = str(reasons)
+
+    return (
+        "📜 <b>Последний сигнал</b>\n\n"
+        f"Время: <b>{time_value}</b>\n"
+        f"Решение: <b>{action}</b>\n"
+        f"Оценка: <b>{score}</b>\n\n"
+        f"Причины:\n<code>{reasons_text}</code>"
+    )
+
+
 def read_last_signal_from_log() -> str:
+    state_text = read_last_signal_from_state()
+
+    if state_text is not None:
+        return state_text
+
     if not EVENTS_LOG_FILE.exists():
         return "📜 <b>Последний сигнал</b>\n\nЛог сигналов пока не найден."
 
@@ -285,6 +336,83 @@ def read_last_signal_from_log() -> str:
         f"Решение: <b>{signal_action}</b>\n"
         f"Оценка: <b>{signal_score}</b>\n\n"
         f"Причины:\n<code>{signal_reasons}</code>"
+    )
+
+
+def get_server_info() -> dict:
+    try:
+        import shutil
+        import platform
+
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+
+        disk = shutil.disk_usage(str(ROOT_DIR))
+
+        result = {
+            "platform": platform.platform(),
+            "disk_total_gb": disk.total / 1024 / 1024 / 1024,
+            "disk_used_gb": disk.used / 1024 / 1024 / 1024,
+            "disk_free_gb": disk.free / 1024 / 1024 / 1024,
+            "cpu_percent": None,
+            "ram_total_gb": None,
+            "ram_used_gb": None,
+            "ram_percent": None,
+            "available": True,
+        }
+
+        if psutil is not None:
+            result["cpu_percent"] = psutil.cpu_percent(interval=0.3)
+
+            memory = psutil.virtual_memory()
+            result["ram_total_gb"] = memory.total / 1024 / 1024 / 1024
+            result["ram_used_gb"] = memory.used / 1024 / 1024 / 1024
+            result["ram_percent"] = memory.percent
+
+        return result
+
+    except Exception as error:
+        return {
+            "available": False,
+            "error": str(error),
+        }
+
+
+def build_server_text() -> str:
+    info = get_server_info()
+
+    if not info.get("available", False):
+        return (
+            "🖥 <b>Сервер</b>\n\n"
+            f"❌ Не удалось получить данные сервера.\n"
+            f"<code>{info.get('error', 'unknown error')}</code>"
+        )
+
+    cpu_text = (
+        f"{info['cpu_percent']:.1f}%"
+        if info.get("cpu_percent") is not None
+        else "недоступно"
+    )
+
+    if info.get("ram_percent") is not None:
+        ram_text = (
+            f"{info['ram_used_gb']:.2f} / "
+            f"{info['ram_total_gb']:.2f} GB "
+            f"({info['ram_percent']:.1f}%)"
+        )
+    else:
+        ram_text = "недоступно, установи psutil"
+
+    return (
+        "🖥 <b>Сервер</b>\n\n"
+        f"Система: <b>{info['platform']}</b>\n\n"
+        f"CPU: <b>{cpu_text}</b>\n"
+        f"RAM: <b>{ram_text}</b>\n\n"
+        f"Диск всего: <b>{info['disk_total_gb']:.2f} GB</b>\n"
+        f"Диск занято: <b>{info['disk_used_gb']:.2f} GB</b>\n"
+        f"Диск свободно: <b>{info['disk_free_gb']:.2f} GB</b>"
     )
 
 
@@ -390,6 +518,13 @@ async def cmd_robot(message: Message):
     await message.answer(build_robot_text(), reply_markup=main_keyboard())
 
 
+async def cmd_server(message: Message):
+    if not await check_access_message(message):
+        return
+
+    await message.answer(build_server_text(), reply_markup=main_keyboard())
+
+
 async def handle_callback(callback: CallbackQuery):
     if not await check_access_callback(callback):
         return
@@ -400,6 +535,8 @@ async def handle_callback(callback: CallbackQuery):
         text = build_trade_text()
     elif callback.data == "last_signal":
         text = read_last_signal_from_log()
+    elif callback.data == "server":
+        text = build_server_text()
     elif callback.data == "robot":
         text = build_robot_text()
     else:
@@ -425,12 +562,8 @@ async def main():
 
     symbol = settings.get("symbol", "XAUUSD")
 
-    if not connect_mt5():
-        print("MT5 connection failed")
-        return
-
-    if not ensure_symbol(symbol):
-        print(f"Symbol check failed: {symbol}")
+    if not ensure_mt5_connection(symbol=symbol, quiet=True):
+        print("MT5 connection failed or symbol check failed")
         return
 
     bot = Bot(
@@ -445,10 +578,11 @@ async def main():
     dp.message.register(cmd_trade, Command("trade"))
     dp.message.register(cmd_signal, Command("signal"))
     dp.message.register(cmd_robot, Command("robot"))
+    dp.message.register(cmd_server, Command("server"))
 
     dp.callback_query.register(
         handle_callback,
-        F.data.in_({"status", "trade", "last_signal", "robot"}),
+        F.data.in_({"status", "trade", "last_signal", "server", "robot"}),
     )
 
     print("Telegram bot started")

@@ -8,9 +8,6 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 LOGS_DIR = ROOT_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
-TRADES_LOG_FILE = LOGS_DIR / "trades.csv"
-EVENTS_LOG_FILE = LOGS_DIR / "events.log"
-
 
 TRADE_FIELDNAMES = [
     "time",
@@ -37,12 +34,27 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def get_month_key() -> str:
+    now = datetime.now(timezone.utc)
+    return f"{now.year}_{now.month:02d}"
+
+
+def get_events_log_file() -> Path:
+    return LOGS_DIR / f"events_{get_month_key()}.log"
+
+
+def get_trades_log_file() -> Path:
+    return LOGS_DIR / f"trades_{get_month_key()}.csv"
+
+
 def init_trades_log():
-    if TRADES_LOG_FILE.exists():
+    trades_log_file = get_trades_log_file()
+
+    if trades_log_file.exists():
         return
 
     with open(
-        TRADES_LOG_FILE,
+        trades_log_file,
         "w",
         newline="",
         encoding="utf-8-sig",
@@ -66,7 +78,7 @@ def log_trade_event(**kwargs):
         row["time"] = utc_now()
 
     with open(
-        TRADES_LOG_FILE,
+        get_trades_log_file(),
         "a",
         newline="",
         encoding="utf-8-sig",
@@ -82,7 +94,7 @@ def log_event(message: str):
     line = f"[{utc_now()}] {message}"
 
     with open(
-        EVENTS_LOG_FILE,
+        get_events_log_file(),
         "a",
         encoding="utf-8",
     ) as file:
