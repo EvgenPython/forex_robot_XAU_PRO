@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -613,6 +614,28 @@ async def cmd_server(message: Message):
     await message.answer(text, reply_markup=main_keyboard())
 
 
+async def safe_edit_callback_message(callback: CallbackQuery, text: str) -> None:
+    """
+    Безопасно обновляет сообщение с кнопками.
+
+    Telegram возвращает Bad Request: message is not modified,
+    если пользователь нажал кнопку повторно, а текст не изменился.
+    Это не настоящая ошибка, поэтому просто игнорируем её.
+    """
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=main_keyboard(),
+        )
+    except TelegramBadRequest as error:
+        error_text = str(error)
+
+        if "message is not modified" in error_text:
+            return
+
+        raise
+
+
 async def handle_callback(callback: CallbackQuery):
     if not await check_access_callback(callback):
         return
@@ -629,7 +652,7 @@ async def handle_callback(callback: CallbackQuery):
     async with _callback_lock:
         try:
             text = await build_text_async(str(callback.data))
-            await callback.message.edit_text(text, reply_markup=main_keyboard())
+            await safe_edit_callback_message(callback, text)
         except Exception as error:
             await callback.message.answer(
                 "❌ Ошибка обработки кнопки.\n\n"
