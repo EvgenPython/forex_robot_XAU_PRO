@@ -26,7 +26,7 @@ from app.telegram_notifier import load_telegram_config
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_FILE = ROOT_DIR / "config" / "strategy_settings.json"
 
-BUTTONS = {"status", "trade", "last_signal", "server", "robot", "stats"}
+BUTTONS = {"status", "trade", "last_signal", "server", "robot", "stats", "efficiency"}
 _callback_lock = asyncio.Lock()
 
 
@@ -59,6 +59,7 @@ def main_keyboard():
     kb.button(text="📊 Статус", callback_data="status")
     kb.button(text="💼 Сделка", callback_data="trade")
     kb.button(text="📈 Статистика", callback_data="stats")
+    kb.button(text="📊 Эффективность", callback_data="efficiency")
     kb.button(text="📜 Последний сигнал", callback_data="last_signal")
     kb.button(text="🖥 Сервер", callback_data="server")
     kb.button(text="⚙️ Робот", callback_data="robot")
@@ -466,6 +467,122 @@ def build_stats_text() -> str:
     )
 
 
+
+
+def calculate_deals_metrics(closed_deals: list[dict]) -> dict:
+    total = len(closed_deals)
+    profits = [float(deal.get("net_profit", 0.0)) for deal in closed_deals]
+
+    wins_values = [value for value in profits if value > 0]
+    loss_values = [value for value in profits if value < 0]
+    breakevens = sum(1 for value in profits if value == 0)
+
+    wins = len(wins_values)
+    losses = len(loss_values)
+
+    gross_profit = sum(wins_values)
+    gross_loss = abs(sum(loss_values))
+    money = sum(profits)
+
+    winrate = (wins / total * 100) if total > 0 else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
+
+    avg_win = (gross_profit / wins) if wins > 0 else 0.0
+    avg_loss = (sum(loss_values) / losses) if losses > 0 else 0.0
+
+    best_trade = max(profits) if profits else 0.0
+    worst_trade = min(profits) if profits else 0.0
+
+    buy_count = 0
+    sell_count = 0
+
+    for deal in closed_deals:
+        direction = str(deal.get("direction", "")).upper()
+        if direction == "BUY":
+            buy_count += 1
+        elif direction == "SELL":
+            sell_count += 1
+
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "breakevens": breakevens,
+        "money": money,
+        "winrate": winrate,
+        "profit_factor": profit_factor,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+    }
+
+
+def format_profit_factor(value: float | None) -> str:
+    if value is None:
+        return "—"
+
+    return f"{value:.2f}"
+
+
+def build_efficiency_text() -> str:
+    settings = load_settings()
+    symbol = settings.get("symbol", "XAUUSD")
+
+    closed_deals = load_closed_deals_from_mt5()
+    periods = get_stats_periods()
+
+    deals_30d = []
+    for deal in closed_deals:
+        deal_time = deal.get("time")
+        if deal_time is None:
+            continue
+
+        if getattr(deal_time, "tzinfo", None) is not None:
+            deal_time = deal_time.astimezone().replace(tzinfo=None)
+
+        if deal_time >= periods["month"]:
+            deals_30d.append(deal)
+
+    metrics = calculate_deals_metrics(deals_30d)
+
+    pf_text = format_profit_factor(metrics["profit_factor"])
+
+    if metrics["buy_count"] == 0 and metrics["sell_count"] == 0 and metrics["total"] > 0:
+        direction_text = "BUY / SELL: <b>недоступно из истории MT5</b>"
+    else:
+        direction_text = (
+            f"BUY: <b>{metrics['buy_count']}</b>\n"
+            f"SELL: <b>{metrics['sell_count']}</b>"
+        )
+
+    icon = "🟢" if metrics["money"] > 0 else "🔴" if metrics["money"] < 0 else "⚪"
+
+    return (
+        "📊 <b>Эффективность стратегии</b>\n"
+        "Период: <b>30 дней</b>\n"
+        "Источник: <b>история MT5</b>\n"
+        f"Инструмент: <b>{symbol}</b>\n\n"
+        f"Всего сделок: <b>{metrics['total']}</b>\n"
+        f"🟢 Прибыльных: <b>{metrics['wins']}</b>\n"
+        f"🔴 Убыточных: <b>{metrics['losses']}</b>\n"
+        f"⚪ Безубыток: <b>{metrics['breakevens']}</b>\n\n"
+        f"Winrate: <b>{metrics['winrate']:.2f}%</b>\n"
+        f"Profit Factor: <b>{pf_text}</b>\n"
+        f"{icon} P/L: <b>{format_money(metrics['money'])}</b>\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"Средняя прибыль: <b>{format_money(metrics['avg_win'])}</b>\n"
+        f"Средний убыток: <b>{format_money(metrics['avg_loss'])}</b>\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"Лучший трейд: <b>{format_money(metrics['best_trade'])}</b>\n"
+        f"Худший трейд: <b>{format_money(metrics['worst_trade'])}</b>\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"{direction_text}"
+    )
+
+
 def read_last_signal_from_state() -> str | None:
     state = load_state()
     last_signal = state.get("last_signal")
@@ -621,6 +738,8 @@ async def build_text_async(kind: str) -> str:
         return await asyncio.to_thread(build_trade_text)
     if kind == "stats":
         return await asyncio.to_thread(build_stats_text)
+    if kind == "efficiency":
+        return await asyncio.to_thread(build_efficiency_text)
     if kind == "last_signal":
         return await asyncio.to_thread(read_last_signal_from_log)
     if kind == "server":
@@ -695,6 +814,14 @@ async def cmd_stats(message: Message):
         return
 
     text = await build_text_async("stats")
+    await message.answer(text, reply_markup=main_keyboard())
+
+
+async def cmd_efficiency(message: Message):
+    if not await check_access_message(message):
+        return
+
+    text = await build_text_async("efficiency")
     await message.answer(text, reply_markup=main_keyboard())
 
 
@@ -779,6 +906,7 @@ async def main():
     dp.message.register(cmd_status, Command("status"))
     dp.message.register(cmd_trade, Command("trade"))
     dp.message.register(cmd_stats, Command("stats"))
+    dp.message.register(cmd_efficiency, Command("efficiency"))
     dp.message.register(cmd_signal, Command("signal"))
     dp.message.register(cmd_robot, Command("robot"))
     dp.message.register(cmd_server, Command("server"))
