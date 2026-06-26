@@ -1,8 +1,8 @@
 import asyncio
+import csv
 import json
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -17,15 +17,16 @@ from app.mt5_client import (
     get_symbol_info,
     get_tick,
 )
+
 from app.state_manager import load_state
 from app.telegram_notifier import load_telegram_config
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_FILE = ROOT_DIR / "config" / "strategy_settings.json"
-EVENTS_LOG_FILE = ROOT_DIR / "logs" / "events.log"
+LOGS_DIR = ROOT_DIR / "logs"
 
-_callback_lock = asyncio.Lock()
+_callback_locks: dict[str, asyncio.Lock] = {}
 
 
 def load_settings() -> dict:
@@ -56,26 +57,58 @@ def main_keyboard():
 
     kb.button(text="📊 Статус", callback_data="status")
     kb.button(text="💼 Сделка", callback_data="trade")
+    kb.button(text="📈 Статистика", callback_data="stats")
     kb.button(text="📜 Последний сигнал", callback_data="last_signal")
     kb.button(text="🖥 Сервер", callback_data="server")
     kb.button(text="⚙️ Робот", callback_data="robot")
 
     kb.adjust(1)
+
     return kb.as_markup()
 
 
 def format_money(value: float) -> str:
     sign = "+" if value > 0 else ""
-    return f"{sign}{float(value):.2f}$"
+    return f"{sign}{value:.2f}$"
 
 
 def format_percent(value: float) -> str:
     sign = "+" if value > 0 else ""
-    return f"{sign}{float(value):.2f}%"
+    return f"{sign}{value:.2f}%"
 
 
 def format_bool(value: bool) -> str:
     return "да" if value else "нет"
+
+
+def format_price(value: float) -> str:
+    return f"{float(value):.2f}"
+
+
+def format_time_short(value) -> str:
+    if not value:
+        return "нет данных"
+
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.strftime("%H:%M")
+    except Exception:
+        text = str(value)
+        if " " in text and ":" in text:
+            try:
+                return text.split(" ", 1)[1][:5]
+            except Exception:
+                return text
+        return text
+
+
+def direction_icon(direction: str) -> str:
+    direction = str(direction).upper()
+    if direction == "BUY":
+        return "🔺 BUY"
+    if direction == "SELL":
+        return "🔻 SELL"
+    return direction
 
 
 def result_icon(value: float) -> str:
@@ -86,62 +119,55 @@ def result_icon(value: float) -> str:
     return "⚪"
 
 
-def direction_text(direction: str) -> str:
-    direction = str(direction).upper()
-    if direction == "BUY":
-        return "🔺 BUY"
-    if direction == "SELL":
-        return "🔻 SELL"
-    return direction
-
-
-def hit_icon(value: bool) -> str:
+def tp_icon(value: bool) -> str:
     return "✅" if value else "❌"
 
 
-def format_mode(dry_run: bool, server: Optional[str] = None) -> str:
-    if dry_run:
-        return "🟣 DRY RUN"
+def detect_mode(settings: dict, account_data: dict | None = None) -> str:
+    dry_run = bool(settings.get("dry_run", True))
 
-    server_text = (server or "").lower()
-    if "demo" in server_text:
+    if dry_run:
+        return "⚪ DRY RUN"
+
+    server = ""
+    if account_data:
+        server = str(account_data.get("server", ""))
+
+    if "demo" in server.lower():
         return "🟡 DEMO"
 
     return "🟢 REAL"
 
 
-def format_m15_time(value: Any) -> str:
-    if value is None:
-        return "нет данных"
+def parse_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).replace(",", "."))
+    except Exception:
+        return default
 
-    text = str(value)
+
+def parse_trade_time(value: str):
+    if not value:
+        return None
+
+    text = str(value).strip()
+
+    # Поддержка формата MT5: 2026.06.26 07:54:45
+    for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
 
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return dt.strftime("%H:%M")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
-        pass
-
-    if " " in text:
-        time_part = text.split(" ", 1)[1]
-        return time_part[:5]
-
-    return text[:5] if len(text) >= 5 else text
-
-
-def get_risk_limits(settings: dict) -> tuple[float, float]:
-    risk_limits = settings.get("risk_limits", {})
-
-    soft_stop = settings.get(
-        "daily_soft_stop_percent",
-        risk_limits.get("daily_soft_stop_percent", 3.0),
-    )
-    hard_stop = settings.get(
-        "daily_hard_stop_percent",
-        risk_limits.get("daily_hard_stop_percent", 4.0),
-    )
-
-    return float(soft_stop), float(hard_stop)
+        return None
 
 
 def get_account_data():
@@ -171,26 +197,23 @@ def get_daily_info(state: dict, account_data: dict) -> dict:
 
     start_balance = float(daily_guard.get("start_balance", account_data["balance"]))
     equity = float(account_data["equity"])
-    balance = float(account_data["balance"])
-
-    daily_money = equity - start_balance
 
     if start_balance <= 0:
         daily_result_percent = 0.0
+        daily_result_money = 0.0
     else:
-        daily_result_percent = (daily_money / start_balance) * 100
+        daily_result_money = equity - start_balance
+        daily_result_percent = (daily_result_money / start_balance) * 100
 
     drawdown_percent = float(daily_guard.get("drawdown_percent", 0.0))
 
     return {
         "start_balance": start_balance,
-        "daily_money": daily_money,
+        "daily_result_money": daily_result_money,
         "daily_result_percent": daily_result_percent,
         "drawdown_percent": drawdown_percent,
         "trading_blocked": bool(daily_guard.get("trading_blocked", False)),
         "hard_stop_triggered": bool(daily_guard.get("hard_stop_triggered", False)),
-        "balance": balance,
-        "equity": equity,
     }
 
 
@@ -238,26 +261,180 @@ def calculate_trade_result(trade: dict) -> dict:
     }
 
 
+def get_latest_trades_file():
+    if not LOGS_DIR.exists():
+        return None
+
+    files = sorted(
+        LOGS_DIR.glob("trades_*.csv"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    return files[0] if files else None
+
+
+def load_trades_from_csv() -> list[dict]:
+    file_path = get_latest_trades_file()
+
+    if file_path is None:
+        return []
+
+    try:
+        with open(file_path, "r", encoding="utf-8-sig", newline="") as file:
+            return list(csv.DictReader(file))
+    except Exception:
+        return []
+
+
+def get_trade_close_time(trade: dict):
+    for key in ("close_time", "time", "close_datetime", "datetime", "date"):
+        value = trade.get(key)
+        parsed = parse_trade_time(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def get_trade_money_result(trade: dict) -> float:
+    # Поддерживаем несколько возможных названий колонок.
+    for key in (
+        "money_result",
+        "profit",
+        "profit_money",
+        "result_money",
+        "pnl",
+        "p_l",
+        "P/L",
+    ):
+        if key in trade and trade.get(key) not in (None, ""):
+            return parse_float(trade.get(key))
+    return 0.0
+
+
+def get_trade_percent_result(trade: dict) -> float:
+    for key in (
+        "percent_result",
+        "result_percent",
+        "profit_percent",
+        "change",
+        "Change",
+    ):
+        if key in trade and trade.get(key) not in (None, ""):
+            return parse_float(str(trade.get(key)).replace("%", ""))
+    return 0.0
+
+
+def build_period_stats(trades: list[dict], start_time: datetime) -> dict:
+    selected = []
+
+    for trade in trades:
+        close_time = get_trade_close_time(trade)
+        if close_time is None:
+            continue
+
+        if close_time.tzinfo is None:
+            close_time = close_time.replace(tzinfo=timezone.utc)
+
+        if close_time >= start_time:
+            selected.append(trade)
+
+    total = len(selected)
+    wins = 0
+    losses = 0
+    breakevens = 0
+    money = 0.0
+    percent = 0.0
+
+    for trade in selected:
+        result_money = get_trade_money_result(trade)
+        result_percent = get_trade_percent_result(trade)
+
+        money += result_money
+        percent += result_percent
+
+        if result_money > 0:
+            wins += 1
+        elif result_money < 0:
+            losses += 1
+        else:
+            breakevens += 1
+
+    winrate = (wins / total * 100) if total > 0 else 0.0
+
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "breakevens": breakevens,
+        "money": money,
+        "percent": percent,
+        "winrate": winrate,
+    }
+
+
+def format_stats_block(title: str, stats: dict) -> str:
+    icon = result_icon(stats["money"])
+
+    return (
+        f"{title}\n\n"
+        f"Сделок: <b>{stats['total']}</b>\n"
+        f"🟢 Прибыльных: <b>{stats['wins']}</b>\n"
+        f"🔴 Убыточных: <b>{stats['losses']}</b>\n"
+        f"⚪ Безубыток: <b>{stats['breakevens']}</b>\n"
+        f"Winrate: <b>{stats['winrate']:.2f}%</b>\n"
+        f"{icon} P/L: <b>{format_money(stats['money'])} / {format_percent(stats['percent'])}</b>"
+    )
+
+
+def build_stats_text() -> str:
+    trades = load_trades_from_csv()
+    file_path = get_latest_trades_file()
+
+    if not trades:
+        return "📈 <b>Статистика</b>\n\nИстория сделок пока не найдена."
+
+    now = datetime.now(timezone.utc)
+
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = now - timedelta(days=7)
+    month_start = now - timedelta(days=30)
+
+    today_stats = build_period_stats(trades, today_start)
+    week_stats = build_period_stats(trades, week_start)
+    month_stats = build_period_stats(trades, month_start)
+
+    file_name = file_path.name if file_path is not None else "не найден"
+
+    return (
+        "📈 <b>Статистика торговли</b>\n"
+        f"Файл: <code>{file_name}</code>\n\n"
+        f"{format_stats_block('📅 Сегодня', today_stats)}\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"{format_stats_block('📆 За 7 дней', week_stats)}\n\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"{format_stats_block('🗓 За 30 дней', month_stats)}"
+    )
+
+
 def build_status_text() -> str:
     settings = load_settings()
     state = load_state()
     account_data = get_account_data()
 
     symbol = settings.get("symbol", "XAUUSD")
-    dry_run = bool(settings.get("dry_run", True))
 
     if account_data is None:
         return "❌ Не удалось получить данные счёта MT5."
 
-    mode = format_mode(dry_run=dry_run, server=account_data.get("server"))
+    mode = detect_mode(settings, account_data)
     daily_info = get_daily_info(state, account_data)
     active_trade = state.get("active_trade")
 
     trade_status = "есть" if active_trade else "нет"
-    last_m15 = format_m15_time(state.get("last_m15_candle"))
+    last_m15 = format_time_short(state.get("last_m15_candle", "нет данных"))
 
-    daily_icon = result_icon(daily_info["daily_money"])
-    open_profit_icon = result_icon(account_data["profit"])
+    daily_icon = result_icon(daily_info["daily_result_money"])
 
     return (
         "📊 <b>Статус бота</b>\n\n"
@@ -266,8 +443,10 @@ def build_status_text() -> str:
         f"Последняя M15: <b>{last_m15}</b>\n\n"
         f"Баланс: <b>{account_data['balance']:.2f}$</b>\n"
         f"Средства: <b>{account_data['equity']:.2f}$</b>\n"
-        f"Результат открытой сделки: <b>{open_profit_icon} {format_money(account_data['profit'])}</b>\n\n"
-        f"{daily_icon} Дневной результат: <b>{format_money(daily_info['daily_money'])} / {format_percent(daily_info['daily_result_percent'])}</b>\n"
+        f"Результат открытой сделки: <b>{format_money(account_data['profit'])}</b>\n\n"
+        f"{daily_icon} Дневной результат: "
+        f"<b>{format_money(daily_info['daily_result_money'])} / "
+        f"{format_percent(daily_info['daily_result_percent'])}</b>\n"
         f"Дневная просадка: <b>{daily_info['drawdown_percent']:.2f}%</b>\n\n"
         f"Открытая сделка: <b>{trade_status}</b>\n"
         f"Новые сделки запрещены: <b>{format_bool(daily_info['trading_blocked'])}</b>"
@@ -281,6 +460,7 @@ def build_trade_text() -> str:
     if trade is None:
         return "💼 <b>Открытая сделка</b>\n\nСейчас открытой сделки нет."
 
+    settings = load_settings()
     account_data = get_account_data()
 
     symbol = trade.get("symbol", "XAUUSD")
@@ -292,7 +472,6 @@ def build_trade_text() -> str:
     tp3 = float(trade.get("tp3", 0))
     volume = float(trade.get("volume", 0))
     score = trade.get("score", "")
-    dry_run = bool(trade.get("dry_run", True))
 
     tp1_hit = bool(trade.get("tp1_hit", False))
     tp2_hit = bool(trade.get("tp2_hit", False))
@@ -300,16 +479,15 @@ def build_trade_text() -> str:
     breakeven_active = bool(trade.get("breakeven_active", False))
     candles_in_trade = int(trade.get("candles_in_trade", 0))
 
-    server = account_data.get("server") if account_data else None
-    mode = format_mode(dry_run=dry_run, server=server)
-
+    mode = detect_mode(settings, account_data)
     result = calculate_trade_result(trade)
 
     if result["available"]:
         icon = result_icon(result["money"])
         result_text = (
             f"Текущая цена: <b>{result['price']:.2f}</b>\n"
-            f"Результат: <b>{icon} {format_money(result['money'])} / {format_percent(result['percent'])}</b>"
+            f"{icon} Результат: <b>{format_money(result['money'])} / "
+            f"{format_percent(result['percent'])}</b>"
         )
     else:
         result_text = "Текущий результат: <b>недоступно</b>"
@@ -318,13 +496,13 @@ def build_trade_text() -> str:
         "💼 <b>Открытая сделка</b>\n\n"
         f"Инструмент: <b>{symbol}</b>\n"
         f"Режим: <b>{mode}</b>\n"
-        f"Направление: <b>{direction_text(direction)}</b>\n"
+        f"Направление: <b>{direction_icon(direction)}</b>\n"
         f"Оценка: <b>{score}</b>\n\n"
         f"Вход: <b>{entry_price:.2f}</b>\n"
         f"Стоп: <b>{stop_loss:.2f}</b>\n\n"
-        f"{hit_icon(tp1_hit)} TP1: <b>{tp1:.2f}</b>\n"
-        f"{hit_icon(tp2_hit)} TP2: <b>{tp2:.2f}</b>\n"
-        f"{hit_icon(tp3_hit)} TP3: <b>{tp3:.2f}</b>\n\n"
+        f"{tp_icon(tp1_hit)} TP1: <b>{tp1:.2f}</b>\n"
+        f"{tp_icon(tp2_hit)} TP2: <b>{tp2:.2f}</b>\n"
+        f"{tp_icon(tp3_hit)} TP3: <b>{tp3:.2f}</b>\n\n"
         f"Объём: <b>{volume}</b>\n"
         f"Свечей в сделке: <b>{candles_in_trade}</b>\n"
         f"BE+ активен: <b>{format_bool(breakeven_active)}</b>\n\n"
@@ -332,7 +510,7 @@ def build_trade_text() -> str:
     )
 
 
-def read_last_signal_from_state() -> Optional[str]:
+def read_last_signal_from_state() -> str | None:
     state = load_state()
     last_signal = state.get("last_signal")
 
@@ -342,10 +520,10 @@ def read_last_signal_from_state() -> Optional[str]:
     action = last_signal.get("action", "нет данных")
     score = last_signal.get("score", "нет данных")
     reasons = last_signal.get("reasons", [])
-    time_value = format_m15_time(last_signal.get("time", "нет данных"))
+    time_value = format_time_short(last_signal.get("time", "нет данных"))
 
     if isinstance(reasons, list):
-        reasons_text = "\n".join([f"- {reason}" for reason in reasons])
+        reasons_text = "\n".join([f"• {reason}" for reason in reasons])
     else:
         reasons_text = str(reasons)
 
@@ -364,44 +542,9 @@ def read_last_signal_from_log() -> str:
     if state_text is not None:
         return state_text
 
-    if not EVENTS_LOG_FILE.exists():
-        return "📜 <b>Последний сигнал</b>\n\nЛог сигналов пока не найден."
-
-    with open(EVENTS_LOG_FILE, "r", encoding="utf-8") as file:
-        lines = file.readlines()
-
-    signal_action = None
-    signal_score = None
-    signal_reasons = None
-    signal_time = None
-
-    for line in reversed(lines):
-        if signal_reasons is None and "Signal reasons:" in line:
-            signal_reasons = line.split("Signal reasons:", 1)[1].strip()
-
-        if signal_score is None and "Signal score:" in line:
-            signal_score = line.split("Signal score:", 1)[1].strip()
-
-        if signal_action is None and "Signal action:" in line:
-            signal_action = line.split("Signal action:", 1)[1].strip()
-
-        if signal_time is None and "NEW M15 CANDLE:" in line:
-            signal_time = line.split("NEW M15 CANDLE:", 1)[1].strip()
-
-        if signal_action and signal_score and signal_reasons:
-            break
-
-    if not signal_action:
-        return "📜 <b>Последний сигнал</b>\n\nСигналов пока не было."
-
-    time_text = format_m15_time(signal_time) if signal_time else "нет данных"
-
     return (
         "📜 <b>Последний сигнал</b>\n\n"
-        f"Время: <b>{time_text}</b>\n"
-        f"Решение: <b>{signal_action}</b>\n"
-        f"Оценка: <b>{signal_score}</b>\n\n"
-        f"Причины:\n<code>{signal_reasons}</code>"
+        "Последний сигнал пока не сохранён в state.json."
     )
 
 
@@ -430,7 +573,8 @@ def get_server_info() -> dict:
         }
 
         if psutil is not None:
-            result["cpu_percent"] = psutil.cpu_percent(interval=0.1)
+            result["cpu_percent"] = psutil.cpu_percent(interval=0.3)
+
             memory = psutil.virtual_memory()
             result["ram_total_gb"] = memory.total / 1024 / 1024 / 1024
             result["ram_used_gb"] = memory.used / 1024 / 1024 / 1024
@@ -448,7 +592,7 @@ def build_server_text() -> str:
     if not info.get("available", False):
         return (
             "🖥 <b>Сервер</b>\n\n"
-            "❌ Не удалось получить данные сервера.\n"
+            f"❌ Не удалось получить данные сервера.\n"
             f"<code>{info.get('error', 'unknown error')}</code>"
         )
 
@@ -484,20 +628,16 @@ def build_robot_text() -> str:
     account_data = get_account_data()
 
     symbol = settings.get("symbol", "XAUUSD")
-    dry_run = bool(settings.get("dry_run", True))
-    server = account_data.get("server") if account_data else None
-    mode = format_mode(dry_run=dry_run, server=server)
+    mode = detect_mode(settings, account_data)
 
     min_score = settings.get("min_score", 75)
     max_score = settings.get("max_score", 90)
     risk_percent = settings.get("risk_percent", 1.0)
-    soft_stop, hard_stop = get_risk_limits(settings)
-    last_m15 = format_m15_time(state.get("last_m15_candle"))
 
-    account_guard = settings.get("account_guard", {})
-    account_guard_enabled = bool(account_guard.get("enabled", False))
-    account_guard_dd = float(account_guard.get("max_drawdown_percent", 8.0))
-    account_guard_pause = int(account_guard.get("pause_days", 14))
+    soft_stop = settings.get("daily_soft_stop_percent", 3.0)
+    hard_stop = settings.get("daily_hard_stop_percent", 4.0)
+
+    last_m15 = format_time_short(state.get("last_m15_candle", "нет данных"))
 
     if account_data is None:
         account_text = "Счёт MT5: <b>недоступен</b>"
@@ -508,10 +648,6 @@ def build_robot_text() -> str:
             f"Торговля разрешена: <b>{format_bool(account_data['trade_allowed'])}</b>"
         )
 
-    account_guard_text = "выключен"
-    if account_guard_enabled:
-        account_guard_text = f"{account_guard_dd:.1f}% / пауза {account_guard_pause} дней"
-
     return (
         "⚙️ <b>Робот</b>\n\n"
         f"Инструмент: <b>{symbol}</b>\n"
@@ -520,8 +656,7 @@ def build_robot_text() -> str:
         f"Риск на сделку: <b>{risk_percent}%</b>\n"
         f"Оценка для входа: <b>{min_score}–{max_score}</b>\n\n"
         f"Soft Stop дня: <b>{soft_stop}%</b>\n"
-        f"Hard Stop дня: <b>{hard_stop}%</b>\n"
-        f"Account Guard: <b>{account_guard_text}</b>\n\n"
+        f"Hard Stop дня: <b>{hard_stop}%</b>\n\n"
         f"{account_text}"
     )
 
@@ -546,6 +681,10 @@ async def check_access_message(message: Message) -> bool:
 async def check_access_callback(callback: CallbackQuery) -> bool:
     config = load_telegram_config()
 
+    if callback.message is None:
+        await callback.answer("Ошибка сообщения.", show_alert=True)
+        return False
+
     if not is_allowed(callback.message.chat.id, config):
         await callback.answer("Доступ запрещён.", show_alert=True)
         return False
@@ -553,18 +692,14 @@ async def check_access_callback(callback: CallbackQuery) -> bool:
     return True
 
 
-async def build_text_async(callback_data: str) -> str:
-    if callback_data == "status":
-        return await asyncio.to_thread(build_status_text)
-    if callback_data == "trade":
-        return await asyncio.to_thread(build_trade_text)
-    if callback_data == "last_signal":
-        return await asyncio.to_thread(read_last_signal_from_log)
-    if callback_data == "server":
-        return await asyncio.to_thread(build_server_text)
-    if callback_data == "robot":
-        return await asyncio.to_thread(build_robot_text)
-    return "Неизвестная команда."
+async def safe_edit_message(callback: CallbackQuery, text: str):
+    try:
+        await callback.message.edit_text(text, reply_markup=main_keyboard())
+    except TelegramBadRequest as error:
+        error_text = str(error).lower()
+        if "message is not modified" in error_text:
+            return
+        raise
 
 
 async def cmd_start(message: Message):
@@ -587,6 +722,14 @@ async def cmd_trade(message: Message):
         return
 
     text = await asyncio.to_thread(build_trade_text)
+    await message.answer(text, reply_markup=main_keyboard())
+
+
+async def cmd_stats(message: Message):
+    if not await check_access_message(message):
+        return
+
+    text = await asyncio.to_thread(build_stats_text)
     await message.answer(text, reply_markup=main_keyboard())
 
 
@@ -614,51 +757,46 @@ async def cmd_server(message: Message):
     await message.answer(text, reply_markup=main_keyboard())
 
 
-async def safe_edit_callback_message(callback: CallbackQuery, text: str) -> None:
-    """
-    Безопасно обновляет сообщение с кнопками.
-
-    Telegram возвращает Bad Request: message is not modified,
-    если пользователь нажал кнопку повторно, а текст не изменился.
-    Это не настоящая ошибка, поэтому просто игнорируем её.
-    """
-    try:
-        await callback.message.edit_text(
-            text,
-            reply_markup=main_keyboard(),
-        )
-    except TelegramBadRequest as error:
-        error_text = str(error)
-
-        if "message is not modified" in error_text:
-            return
-
-        raise
-
-
 async def handle_callback(callback: CallbackQuery):
     if not await check_access_callback(callback):
         return
 
-    await callback.answer("Обновляю...")
+    await callback.answer()
 
-    if _callback_lock.locked():
-        await callback.message.answer(
-            "⏳ Предыдущий запрос ещё обрабатывается. Подожди пару секунд.",
-            reply_markup=main_keyboard(),
-        )
+    chat_id = str(callback.message.chat.id)
+    lock = _callback_locks.setdefault(chat_id, asyncio.Lock())
+
+    if lock.locked():
         return
 
-    async with _callback_lock:
+    async with lock:
         try:
-            text = await build_text_async(str(callback.data))
-            await safe_edit_callback_message(callback, text)
+            if callback.data == "status":
+                text = await asyncio.to_thread(build_status_text)
+            elif callback.data == "trade":
+                text = await asyncio.to_thread(build_trade_text)
+            elif callback.data == "stats":
+                text = await asyncio.to_thread(build_stats_text)
+            elif callback.data == "last_signal":
+                text = await asyncio.to_thread(read_last_signal_from_log)
+            elif callback.data == "server":
+                text = await asyncio.to_thread(build_server_text)
+            elif callback.data == "robot":
+                text = await asyncio.to_thread(build_robot_text)
+            else:
+                text = "Неизвестная команда."
+
+            await safe_edit_message(callback, text)
+
         except Exception as error:
-            await callback.message.answer(
-                "❌ Ошибка обработки кнопки.\n\n"
-                f"<code>{error}</code>",
-                reply_markup=main_keyboard(),
+            error_text = (
+                "❌ <b>Ошибка обработки кнопки.</b>\n\n"
+                f"<code>{error}</code>"
             )
+            try:
+                await safe_edit_message(callback, error_text)
+            except Exception:
+                pass
 
 
 async def main():
@@ -691,16 +829,18 @@ async def main():
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_status, Command("status"))
     dp.message.register(cmd_trade, Command("trade"))
+    dp.message.register(cmd_stats, Command("stats"))
     dp.message.register(cmd_signal, Command("signal"))
     dp.message.register(cmd_robot, Command("robot"))
     dp.message.register(cmd_server, Command("server"))
 
     dp.callback_query.register(
         handle_callback,
-        F.data.in_({"status", "trade", "last_signal", "server", "robot"}),
+        F.data.in_({"status", "trade", "stats", "last_signal", "server", "robot"}),
     )
 
     print("Telegram bot started")
+
     await dp.start_polling(bot)
 
 
