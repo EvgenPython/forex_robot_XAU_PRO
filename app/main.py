@@ -27,6 +27,7 @@ from app.state_manager import (
     get_active_trade,
     save_trade,
     clear_trade,
+    save_last_signal,
 )
 
 from app.daily_guard import (
@@ -165,6 +166,16 @@ def main():
             m15=m15,
             settings=settings,
         )
+
+        save_last_signal({
+            "time": current_candle_time,
+            "symbol": symbol,
+            "action": signal.action.value,
+            "score": signal.score,
+            "buy_score": signal.buy_score,
+            "sell_score": signal.sell_score,
+            "reasons": signal.reasons,
+        })
 
         log_event(f"Signal action: {signal.action.value}")
         log_event(f"Signal score: {signal.score}")

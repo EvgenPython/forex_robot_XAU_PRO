@@ -590,22 +590,44 @@ def read_last_signal_from_state() -> str | None:
     if not last_signal:
         return None
 
-    action = last_signal.get("action", "нет данных")
-    score = last_signal.get("score", "нет данных")
+    symbol = last_signal.get("symbol", "XAUUSD")
+    action = str(last_signal.get("action", "WAIT")).upper()
+    score = last_signal.get("score", 0)
+    buy_score = last_signal.get("buy_score", 0)
+    sell_score = last_signal.get("sell_score", 0)
     reasons = last_signal.get("reasons", [])
     time_value = format_short_time(last_signal.get("time", "нет данных"))
 
-    if isinstance(reasons, list):
-        reasons_text = "\n".join([f"- {reason}" for reason in reasons])
+    if action == "BUY":
+        decision = "BUY ⬆️"
+    elif action == "SELL":
+        decision = "SELL ⬇️"
     else:
-        reasons_text = str(reasons)
+        decision = "WAIT"
+
+    if isinstance(reasons, list) and reasons:
+        reasons_text = "\n".join([f"• {reason}" for reason in reasons])
+    elif reasons:
+        reasons_text = f"• {reasons}"
+    else:
+        reasons_text = "• Причины не указаны"
 
     return (
         "📜 <b>Последний сигнал</b>\n\n"
-        f"Время: <b>{time_value}</b>\n"
-        f"Решение: <b>{action}</b>\n"
-        f"Оценка: <b>{score}</b>\n\n"
-        f"Причины:\n<code>{reasons_text}</code>"
+        "Инструмент:\n"
+        f"<b>{symbol}</b>\n\n"
+        "Время:\n"
+        f"<b>{time_value}</b>\n\n"
+        "🟢 BUY Score:\n"
+        f"<b>{buy_score}%</b>\n\n"
+        "🔴 SELL Score:\n"
+        f"<b>{sell_score}%</b>\n\n"
+        "Итоговый Score:\n"
+        f"<b>{score}%</b>\n\n"
+        "Решение:\n"
+        f"<b>{decision}</b>\n\n"
+        "Причины:\n\n"
+        f"{reasons_text}"
     )
 
 

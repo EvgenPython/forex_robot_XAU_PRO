@@ -189,6 +189,8 @@ def generate_signal(h4, h1, m15, settings: dict) -> Signal:
                 f"SELL score={sell_score}",
                 f"Minimum score not reached: {min_score}",
             ],
+            buy_score=buy_score,
+            sell_score=sell_score,
         )
 
     if best_score > max_score:
@@ -200,6 +202,8 @@ def generate_signal(h4, h1, m15, settings: dict) -> Signal:
                 f"SELL score={sell_score}",
                 f"Max score exceeded: {max_score}",
             ],
+            buy_score=buy_score,
+            sell_score=sell_score,
         )
 
     # BUY
@@ -213,6 +217,8 @@ def generate_signal(h4, h1, m15, settings: dict) -> Signal:
                 action=SignalAction.WAIT,
                 score=buy_score,
                 reasons=["No swing low"],
+                buy_score=buy_score,
+                sell_score=sell_score,
             )
 
         if not stop_distance_filter_ok(
@@ -229,6 +235,8 @@ def generate_signal(h4, h1, m15, settings: dict) -> Signal:
                     *buy_reasons,
                     "Stop distance filter blocked BUY",
                 ],
+                buy_score=buy_score,
+                sell_score=sell_score,
             )
 
         tp1 = calculate_tp(
@@ -277,6 +285,8 @@ def generate_signal(h4, h1, m15, settings: dict) -> Signal:
                 action=SignalAction.WAIT,
                 score=sell_score,
                 reasons=["No swing high"],
+                buy_score=buy_score,
+                sell_score=sell_score,
             )
 
         if not stop_distance_filter_ok(
@@ -293,6 +303,8 @@ def generate_signal(h4, h1, m15, settings: dict) -> Signal:
                     *sell_reasons,
                     "Stop distance filter blocked SELL",
                 ],
+                buy_score=buy_score,
+                sell_score=sell_score,
             )
 
         tp1 = calculate_tp(
@@ -338,4 +350,6 @@ def generate_signal(h4, h1, m15, settings: dict) -> Signal:
             f"SELL score={sell_score}",
             "No dominant direction",
         ],
+        buy_score=buy_score,
+        sell_score=sell_score,
     )

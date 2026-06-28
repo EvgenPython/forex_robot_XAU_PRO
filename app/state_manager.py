@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 STATE_DIR = ROOT_DIR / "state"
@@ -65,3 +64,14 @@ def get_last_m15_candle():
     state = load_state()
 
     return state.get("last_m15_candle")
+
+
+def save_last_signal(signal_data: dict):
+    state = load_state()
+    state["last_signal"] = signal_data
+    save_state(state)
+
+
+def get_last_signal():
+    state = load_state()
+    return state.get("last_signal")
