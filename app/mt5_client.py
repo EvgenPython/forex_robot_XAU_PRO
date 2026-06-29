@@ -1,6 +1,6 @@
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import MetaTrader5 as mt5
@@ -252,8 +252,14 @@ def get_closed_deals_from_history(date_from, date_to, symbol: str | None = None)
 
         entry = int(getattr(deal, "entry", -1))
 
-        # MT5: DEAL_ENTRY_OUT = 1, это выход/закрытие позиции.
-        if entry != 1:
+        # MT5:
+        # DEAL_ENTRY_OUT = 1
+        # DEAL_ENTRY_INOUT = 2
+        # DEAL_ENTRY_OUT_BY = 3
+        #
+        # Основное закрытие обычно entry=1.
+        # entry=2 и entry=3 оставлены как безопасная поддержка других типов закрытия.
+        if entry not in (1, 2, 3):
             continue
 
         profit = float(getattr(deal, "profit", 0.0))
@@ -276,8 +282,7 @@ def get_closed_deals_from_history(date_from, date_to, symbol: str | None = None)
 
         result.append({
             "time": datetime.fromtimestamp(
-                int(getattr(deal, "time", 0)),
-                tz=timezone.utc,
+                int(getattr(deal, "time", 0))
             ),
             "ticket": int(getattr(deal, "ticket", 0)),
             "position_id": position_id,

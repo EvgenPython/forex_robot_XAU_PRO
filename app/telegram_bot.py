@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_FILE = ROOT_DIR / "config" / "strategy_settings.json"
 
 BUTTONS = {"status", "trade", "last_signal", "server", "robot", "stats", "efficiency"}
+STATS_TIMEZONE = ZoneInfo("Europe/Kyiv")
 _callback_lock = asyncio.Lock()
 
 
@@ -165,6 +167,21 @@ def parse_datetime(value: Any) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def normalize_deal_time_to_stats_timezone(value: Any) -> datetime | None:
+    if value is None:
+        return None
+
+    if not isinstance(value, datetime):
+        return None
+
+    # get_closed_deals_from_history должен возвращать datetime.
+    # Если datetime почему-то naive, считаем его UTC, чтобы не зависеть от времени VPS.
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(STATS_TIMEZONE)
+
+
 def get_account_data() -> dict | None:
     settings = load_settings()
     symbol = settings.get("symbol", "XAUUSD")
@@ -267,7 +284,15 @@ def build_status_text() -> str:
     trade_status = "есть" if active_trade else "нет"
     last_m15 = format_short_time(state.get("last_m15_candle", "нет данных"))
 
-    day_icon = "🟢" if daily_info["daily_result_money"] > 0 else "🔴" if daily_info["daily_result_money"] < 0 else "⚪"
+    closed_deals = load_closed_deals_from_mt5()
+    periods = get_stats_periods()
+    today_stats = build_period_stats(closed_deals, periods["today"])
+
+    daily_result_money = float(today_stats.get("money", 0.0))
+    base_balance = float(daily_info.get("start_balance", account_data["balance"]))
+    daily_result_percent = (daily_result_money / base_balance * 100) if base_balance > 0 else 0.0
+
+    day_icon = "🟢" if daily_result_money > 0 else "🔴" if daily_result_money < 0 else "⚪"
 
     return (
         "📊 <b>Статус бота</b>\n\n"
@@ -277,7 +302,7 @@ def build_status_text() -> str:
         f"Баланс: <b>{account_data['balance']:.2f}$</b>\n"
         f"Средства: <b>{account_data['equity']:.2f}$</b>\n"
         f"Результат открытой сделки: <b>{format_money(account_data['profit'])}</b>\n\n"
-        f"{day_icon} Дневной результат: <b>{format_money(daily_info['daily_result_money'])} / {format_percent(daily_info['daily_result_percent'])}</b>\n"
+        f"{day_icon} Дневной результат: <b>{format_money(daily_result_money)} / {format_percent(daily_result_percent)}</b>\n"
         f"Дневная просадка: <b>{daily_info['drawdown_percent']:.2f}%</b>\n\n"
         f"Открытая сделка: <b>{trade_status}</b>\n"
         f"Новые сделки запрещены: <b>{format_bool(daily_info['trading_blocked'])}</b>"
@@ -341,11 +366,7 @@ def build_trade_text() -> str:
 
 
 def get_stats_periods() -> dict:
-    """
-    Периоды считаем по локальному времени VPS/MT5.
-    Это ближе к тому, что пользователь видит во вкладке History в терминале.
-    """
-    now = datetime.now()
+    now = datetime.now(STATS_TIMEZONE)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = now - timedelta(days=7)
     month_start = now - timedelta(days=30)
@@ -356,7 +377,6 @@ def get_stats_periods() -> dict:
         "month": month_start,
         "to": now + timedelta(minutes=1),
     }
-
 
 def load_closed_deals_from_mt5() -> list[dict]:
     settings = load_settings()
@@ -373,16 +393,16 @@ def load_closed_deals_from_mt5() -> list[dict]:
 def build_period_stats(closed_deals: list[dict], start_time: datetime) -> dict:
     selected = []
 
+    if start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=STATS_TIMEZONE)
+    else:
+        start_time = start_time.astimezone(STATS_TIMEZONE)
+
     for deal in closed_deals:
-        deal_time = deal.get("time")
+        deal_time = normalize_deal_time_to_stats_timezone(deal.get("time"))
 
         if deal_time is None:
             continue
-
-        # mt5_client возвращает UTC-aware datetime.
-        # Для сравнения с локальным периодом убираем timezone и сравниваем как локальную дату/время.
-        if getattr(deal_time, "tzinfo", None) is not None:
-            deal_time = deal_time.astimezone().replace(tzinfo=None)
 
         if deal_time >= start_time:
             selected.append(deal)
@@ -419,7 +439,6 @@ def build_period_stats(closed_deals: list[dict], start_time: datetime) -> dict:
         "profit_factor": profit_factor,
     }
 
-
 def format_stats_block(title: str, stats: dict, base_balance: float) -> str:
     money = float(stats["money"])
     percent = (money / base_balance * 100) if base_balance > 0 else 0.0
@@ -441,12 +460,16 @@ def format_stats_block(title: str, stats: dict, base_balance: float) -> str:
 
 def build_stats_text() -> str:
     settings = load_settings()
+    state = load_state()
     symbol = settings.get("symbol", "XAUUSD")
 
     closed_deals = load_closed_deals_from_mt5()
 
     account_data = get_account_data()
-    base_balance = account_data["balance"] if account_data else 0.0
+    account_balance = account_data["balance"] if account_data else 0.0
+
+    daily_guard = state.get("daily_guard", {})
+    today_base_balance = float(daily_guard.get("start_balance", account_balance))
 
     periods = get_stats_periods()
 
@@ -459,11 +482,11 @@ def build_stats_text() -> str:
         "Источник: <b>история MT5</b>\n"
         f"Инструмент: <b>{symbol}</b>\n"
         "Учитываются только закрытые сделки.\n\n"
-        f"{format_stats_block('📅 Сегодня', today_stats, base_balance)}\n\n"
+        f"{format_stats_block('📅 Сегодня', today_stats, today_base_balance)}\n\n"
         "━━━━━━━━━━━━━━\n\n"
-        f"{format_stats_block('📆 За 7 дней', week_stats, base_balance)}\n\n"
+        f"{format_stats_block('📆 За 7 дней', week_stats, account_balance)}\n\n"
         "━━━━━━━━━━━━━━\n\n"
-        f"{format_stats_block('🗓 За 30 дней', month_stats, base_balance)}"
+        f"{format_stats_block('🗓 За 30 дней', month_stats, account_balance)}"
     )
 
 
@@ -540,8 +563,10 @@ def build_efficiency_text() -> str:
         if deal_time is None:
             continue
 
-        if getattr(deal_time, "tzinfo", None) is not None:
-            deal_time = deal_time.astimezone().replace(tzinfo=None)
+        deal_time = normalize_deal_time_to_stats_timezone(deal_time)
+
+        if deal_time is None:
+            continue
 
         if deal_time >= periods["month"]:
             deals_30d.append(deal)
