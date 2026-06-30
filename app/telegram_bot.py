@@ -383,9 +383,12 @@ def load_closed_deals_from_mt5() -> list[dict]:
     symbol = settings.get("symbol", "XAUUSD")
     periods = get_stats_periods()
 
+    date_from = periods["month"].replace(tzinfo=None)
+    date_to = periods["to"].replace(tzinfo=None)
+
     return get_closed_deals_from_history(
-        date_from=periods["month"],
-        date_to=periods["to"],
+        date_from=date_from,
+        date_to=date_to,
         symbol=symbol,
     )
 
