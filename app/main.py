@@ -22,6 +22,8 @@ from app.position_manager import (
 )
 
 from app.state_manager import (
+    load_state,
+    save_state,
     get_last_m15_candle,
     save_last_m15_candle,
     get_active_trade,
@@ -36,6 +38,11 @@ from app.daily_guard import (
     is_hard_stop_triggered,
 )
 
+from app.account_guard import (
+    update_account_guard,
+    is_account_blocked,
+)
+
 from app.logger import (
     log_event,
     log_trade_event,
@@ -45,6 +52,7 @@ from app.telegram_notifier import (
     notify_open_trade,
     notify_daily_guard,
     notify_error,
+    notify_account_guard,
 )
 
 
@@ -74,7 +82,8 @@ def main():
 
         daily_soft_stop_percent = float(settings.get("daily_soft_stop_percent", 3.0))
         daily_hard_stop_percent = float(settings.get("daily_hard_stop_percent", 4.0))
-
+        account_guard_percent = float(settings.get("account_guard_percent", 8.0))
+        account_guard_pause_days = int(settings.get("account_guard_pause_days", 14))
 
         if not ensure_mt5_connection(symbol=symbol, quiet=True):
             log_event("MT5 connection failed or symbol check failed")
@@ -94,6 +103,48 @@ def main():
             soft_stop_percent=daily_soft_stop_percent,
             hard_stop_percent=daily_hard_stop_percent,
         )
+
+        account_guard = update_account_guard(
+            account_balance=float(account.balance),
+            account_equity=float(account.equity),
+            max_drawdown_percent=account_guard_percent,
+            pause_days=account_guard_pause_days,
+        )
+
+        if is_account_blocked(account_guard):
+            log_event("Account guard is active. Trading is blocked.")
+
+            if not account_guard.get("notification_sent", False):
+                try:
+                    notify_account_guard(
+                        drawdown_percent=float(account_guard.get("drawdown_percent", 0.0)),
+                        max_drawdown_percent=float(
+                            account_guard.get("max_drawdown_percent", account_guard_percent)
+                        ),
+                        blocked_until=account_guard.get("blocked_until"),
+                    )
+
+                    account_guard["notification_sent"] = True
+
+                    state = load_state()
+                    state["account_guard"] = account_guard
+                    save_state(state)
+
+                except Exception as error:
+                    log_event(f"Telegram account guard notification failed: {error}")
+
+            active_trade = get_active_trade()
+            real_position_exists = has_open_position(symbol)
+
+            if dry_run:
+                if active_trade is not None:
+                    log_event("DRY RUN: clearing active trade due to account guard")
+                    clear_trade()
+            else:
+                if real_position_exists:
+                    close_position(symbol=symbol, reason="ACCOUNT_GUARD")
+
+            return
 
         market_data = load_market_data(symbol)
 

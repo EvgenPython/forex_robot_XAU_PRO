@@ -23,7 +23,6 @@ from app.mt5_client import (
 from app.state_manager import load_state
 from app.telegram_notifier import load_telegram_config
 
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_FILE = ROOT_DIR / "config" / "strategy_settings.json"
 
@@ -364,7 +363,6 @@ def build_trade_text() -> str:
     )
 
 
-
 def get_stats_periods() -> dict:
     now = datetime.now(STATS_TIMEZONE)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -377,6 +375,7 @@ def get_stats_periods() -> dict:
         "month": month_start,
         "to": now + timedelta(minutes=1),
     }
+
 
 def load_closed_deals_from_mt5() -> list[dict]:
     settings = load_settings()
@@ -442,6 +441,7 @@ def build_period_stats(closed_deals: list[dict], start_time: datetime) -> dict:
         "profit_factor": profit_factor,
     }
 
+
 def format_stats_block(title: str, stats: dict, base_balance: float) -> str:
     money = float(stats["money"])
     percent = (money / base_balance * 100) if base_balance > 0 else 0.0
@@ -491,8 +491,6 @@ def build_stats_text() -> str:
         "━━━━━━━━━━━━━━\n\n"
         f"{format_stats_block('🗓 За 30 дней', month_stats, account_balance)}"
     )
-
-
 
 
 def calculate_deals_metrics(closed_deals: list[dict]) -> dict:
@@ -757,6 +755,29 @@ def build_robot_text() -> str:
     soft_stop = settings.get("daily_soft_stop_percent", 3.0)
     hard_stop = settings.get("daily_hard_stop_percent", 4.0)
 
+    account_guard = state.get("account_guard", {})
+
+    account_guard_percent = settings.get("account_guard_percent", 8.0)
+    account_guard_pause_days = settings.get("account_guard_pause_days", 14)
+
+    account_guard_blocked = bool(account_guard.get("blocked", False))
+    account_guard_until = account_guard.get("blocked_until")
+
+    if account_guard_blocked:
+        account_guard_status = "🔴 Заблокирован"
+
+        if account_guard_until:
+            try:
+                dt = datetime.fromisoformat(account_guard_until)
+                account_guard_until = dt.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                pass
+        else:
+            account_guard_until = "неизвестно"
+    else:
+        account_guard_status = "🟢 Активен"
+        account_guard_until = "—"
+
     last_m15 = format_short_time(state.get("last_m15_candle", "нет данных"))
 
     if account_data is None:
@@ -777,6 +798,15 @@ def build_robot_text() -> str:
         f"Оценка для входа: <b>{min_score}–{max_score}</b>\n\n"
         f"Soft Stop дня: <b>{soft_stop}%</b>\n"
         f"Hard Stop дня: <b>{hard_stop}%</b>\n\n"
+
+        "━━━━━━━━━━━━━━\n\n"
+
+        "🛡 <b>Account Guard</b>\n"
+        f"Лимит: <b>{account_guard_percent}%</b>\n"
+        f"Пауза: <b>{account_guard_pause_days} дней</b>\n"
+        f"Статус: <b>{account_guard_status}</b>\n"
+        f"До: <b>{account_guard_until}</b>\n\n"
+
         f"{account_text}"
     )
 

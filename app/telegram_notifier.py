@@ -222,3 +222,21 @@ def notify_error(error_text: str):
     )
 
     send_telegram_message(text)
+
+def notify_account_guard(
+    drawdown_percent: float,
+    max_drawdown_percent: float,
+    blocked_until: str | None,
+):
+    until_text = blocked_until or "неизвестно"
+
+    text = (
+        "🛑 <b>ACCOUNT GUARD</b>\n\n"
+        "Общая просадка счёта достигла лимита.\n\n"
+        f"Просадка: <b>{drawdown_percent:.2f}%</b>\n"
+        f"Лимит: <b>{max_drawdown_percent:.2f}%</b>\n\n"
+        "Торговля остановлена.\n"
+        f"Блокировка до: <b>{until_text}</b>"
+    )
+
+    send_telegram_message(text)

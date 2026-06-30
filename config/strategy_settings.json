@@ -1,37 +1,29 @@
 {
   "symbol": "XAUUSD",
-
   "risk_percent": 1.0,
   "dry_run": true,
-
   "min_score": 75,
   "max_score": 90,
-
   "max_stop_atr": 2.0,
-
   "breakeven_offset": 0.10,
-
   "ema": {
     "fast_period": 50,
     "slow_period": 200
   },
-
   "macd": {
     "fast_period": 12,
     "slow_period": 26,
     "signal_period": 9
   },
-
   "atr": {
     "period": 14
   },
-
   "tp1_rr": 1.0,
   "tp2_rr": 2.0,
   "tp3_rr": 3.0,
-
   "distance_from_ema_atr_multiplier": 1.2,
-
   "daily_soft_stop_percent": 3.0,
-  "daily_hard_stop_percent": 4.0
+  "daily_hard_stop_percent": 4.0,
+  "account_guard_percent": 8.0,
+  "account_guard_pause_days": 14
 }

@@ -14,6 +14,9 @@ def load_state():
         return {
             "active_trade": None,
             "last_m15_candle": None,
+            "last_signal": None,
+            "daily_guard": None,
+            "account_guard": None,
         }
 
     with open(STATE_FILE, "r", encoding="utf-8") as file:
