@@ -268,28 +268,31 @@ def calculate_trade_result(trade: dict) -> dict:
 def build_status_text() -> str:
     settings = load_settings()
     state = load_state()
-    account_data = get_account_data()
 
     symbol = settings.get("symbol", "XAUUSD")
     dry_run = bool(settings.get("dry_run", True))
+    mode = format_mode(dry_run=dry_run, account_data=None)
 
-    if account_data is None:
-        return "❌ Не удалось получить данные счёта MT5."
-
-    mode = format_mode(dry_run=dry_run, account_data=account_data)
-    daily_info = get_daily_info(state, account_data)
+    daily_guard = state.get("daily_guard") or {}
     active_trade = state.get("active_trade")
 
     trade_status = "есть" if active_trade else "нет"
     last_m15 = format_short_time(state.get("last_m15_candle", "нет данных"))
 
-    closed_deals = load_closed_deals_from_mt5()
-    periods = get_stats_periods()
-    today_stats = build_period_stats(closed_deals, periods["today"])
+    balance = parse_float(daily_guard.get("current_balance", 0.0))
+    equity = parse_float(daily_guard.get("current_equity", 0.0))
+    profit = parse_float(daily_guard.get("current_profit", 0.0))
 
-    daily_result_money = float(today_stats.get("money", 0.0))
-    base_balance = float(daily_info.get("start_balance", account_data["balance"]))
-    daily_result_percent = (daily_result_money / base_balance * 100) if base_balance > 0 else 0.0
+    daily_result_money = parse_float(daily_guard.get("daily_result", 0.0))
+    drawdown_percent = parse_float(daily_guard.get("drawdown_percent", 0.0))
+    trading_blocked = bool(daily_guard.get("trading_blocked", False))
+
+    start_balance = parse_float(daily_guard.get("start_balance", balance))
+
+    if start_balance > 0:
+        daily_result_percent = (daily_result_money / start_balance) * 100
+    else:
+        daily_result_percent = 0.0
 
     day_icon = "🟢" if daily_result_money > 0 else "🔴" if daily_result_money < 0 else "⚪"
 
@@ -298,15 +301,14 @@ def build_status_text() -> str:
         f"Инструмент: <b>{symbol}</b>\n"
         f"Режим: <b>{mode}</b>\n"
         f"Последняя M15: <b>{last_m15}</b>\n\n"
-        f"Баланс: <b>{account_data['balance']:.2f}$</b>\n"
-        f"Средства: <b>{account_data['equity']:.2f}$</b>\n"
-        f"Результат открытой сделки: <b>{format_money(account_data['profit'])}</b>\n\n"
+        f"Баланс: <b>{balance:.2f}$</b>\n"
+        f"Средства: <b>{equity:.2f}$</b>\n"
+        f"Результат открытой сделки: <b>{format_money(profit)}</b>\n\n"
         f"{day_icon} Дневной результат: <b>{format_money(daily_result_money)} / {format_percent(daily_result_percent)}</b>\n"
-        f"Дневная просадка: <b>{daily_info['drawdown_percent']:.2f}%</b>\n\n"
+        f"Дневная просадка: <b>{drawdown_percent:.2f}%</b>\n\n"
         f"Открытая сделка: <b>{trade_status}</b>\n"
-        f"Новые сделки запрещены: <b>{format_bool(daily_info['trading_blocked'])}</b>"
+        f"Новые сделки запрещены: <b>{format_bool(trading_blocked)}</b>"
     )
-
 
 def build_trade_text() -> str:
     state = load_state()
@@ -332,18 +334,22 @@ def build_trade_text() -> str:
     breakeven_active = bool(trade.get("breakeven_active", False))
     candles_in_trade = int(trade.get("candles_in_trade", 0))
 
-    account_data = get_account_data()
-    mode = format_mode(dry_run=dry_run, account_data=account_data)
-    result = calculate_trade_result(trade)
+    mode = format_mode(dry_run=dry_run, account_data=None)
 
-    if result["available"]:
-        result_icon = "🟢" if result["money"] > 0 else "🔴" if result["money"] < 0 else "⚪"
+    current_price = trade.get("current_price")
+    floating_profit = parse_float(trade.get("floating_profit", 0.0))
+    floating_percent = parse_float(trade.get("floating_percent", 0.0))
+    cache_updated_at = format_short_time(trade.get("cache_updated_at"))
+
+    if current_price is not None:
+        result_icon = "🟢" if floating_profit > 0 else "🔴" if floating_profit < 0 else "⚪"
         result_text = (
-            f"Текущая цена: <b>{result['price']:.2f}</b>\n"
-            f"{result_icon} Результат: <b>{format_money(result['money'])} / {format_percent(result['percent'])}</b>"
+            f"Текущая цена: <b>{float(current_price):.2f}</b>\n"
+            f"{result_icon} Результат: <b>{format_money(floating_profit)} / {format_percent(floating_percent)}</b>\n"
+            f"Обновлено: <b>{cache_updated_at}</b>"
         )
     else:
-        result_text = "Текущий результат: <b>недоступно</b>"
+        result_text = "Текущий результат: <b>ожидает обновления state.json</b>"
 
     return (
         "💼 <b>Открытая сделка</b>\n\n"
@@ -742,11 +748,10 @@ def build_server_text() -> str:
 def build_robot_text() -> str:
     settings = load_settings()
     state = load_state()
-    account_data = get_account_data()
 
     symbol = settings.get("symbol", "XAUUSD")
     dry_run = bool(settings.get("dry_run", True))
-    mode = format_mode(dry_run=dry_run, account_data=account_data)
+    mode = format_mode(dry_run=dry_run, account_data=None)
 
     min_score = settings.get("min_score", 75)
     max_score = settings.get("max_score", 90)
@@ -755,10 +760,34 @@ def build_robot_text() -> str:
     soft_stop = settings.get("daily_soft_stop_percent", 3.0)
     hard_stop = settings.get("daily_hard_stop_percent", 4.0)
 
-    account_guard = state.get("account_guard", {})
+    daily_guard = state.get("daily_guard") or {}
 
-    account_guard_percent = settings.get("account_guard_percent", 8.0)
-    account_guard_pause_days = settings.get("account_guard_pause_days", 14)
+    daily_result = parse_float(daily_guard.get("daily_result", 0.0))
+    drawdown_percent = parse_float(daily_guard.get("drawdown_percent", 0.0))
+    trading_blocked = bool(daily_guard.get("trading_blocked", False))
+    hard_stop_triggered = bool(daily_guard.get("hard_stop_triggered", False))
+
+    if hard_stop_triggered:
+        daily_guard_status = "🔴 Робот остановлен"
+    elif trading_blocked:
+        daily_guard_status = "🟡 Новые сделки запрещены"
+    else:
+        daily_guard_status = "🟢 Активен"
+
+    account_guard = state.get("account_guard") or {}
+
+    account_guard_percent = parse_float(
+        account_guard.get(
+            "max_drawdown_percent",
+            settings.get("account_guard_percent", 8.0),
+        )
+    )
+    account_guard_pause_days = int(
+        account_guard.get(
+            "pause_days",
+            settings.get("account_guard_pause_days", 14),
+        )
+    )
 
     account_guard_blocked = bool(account_guard.get("blocked", False))
     account_guard_until = account_guard.get("blocked_until")
@@ -780,15 +809,6 @@ def build_robot_text() -> str:
 
     last_m15 = format_short_time(state.get("last_m15_candle", "нет данных"))
 
-    if account_data is None:
-        account_text = "Счёт MT5: <b>недоступен</b>"
-    else:
-        account_text = (
-            f"Счёт: <b>{account_data['login']}</b>\n"
-            f"Сервер: <b>{account_data['server']}</b>\n"
-            f"Торговля разрешена: <b>{format_bool(account_data['trade_allowed'])}</b>"
-        )
-
     return (
         "⚙️ <b>Робот</b>\n\n"
         f"Инструмент: <b>{symbol}</b>\n"
@@ -796,8 +816,15 @@ def build_robot_text() -> str:
         f"Последняя M15: <b>{last_m15}</b>\n\n"
         f"Риск на сделку: <b>{risk_percent}%</b>\n"
         f"Оценка для входа: <b>{min_score}–{max_score}</b>\n\n"
-        f"Soft Stop дня: <b>{soft_stop}%</b>\n"
-        f"Hard Stop дня: <b>{hard_stop}%</b>\n\n"
+
+        "━━━━━━━━━━━━━━\n\n"
+
+        "🛡 <b>Daily Guard</b>\n"
+        f"Soft Stop: <b>{soft_stop}%</b>\n"
+        f"Hard Stop: <b>{hard_stop}%</b>\n\n"
+        f"Дневной результат: <b>{format_money(daily_result)}</b>\n"
+        f"Просадка: <b>{drawdown_percent:.2f}%</b>\n"
+        f"Статус: <b>{daily_guard_status}</b>\n\n"
 
         "━━━━━━━━━━━━━━\n\n"
 
@@ -805,11 +832,8 @@ def build_robot_text() -> str:
         f"Лимит: <b>{account_guard_percent}%</b>\n"
         f"Пауза: <b>{account_guard_pause_days} дней</b>\n"
         f"Статус: <b>{account_guard_status}</b>\n"
-        f"До: <b>{account_guard_until}</b>\n\n"
-
-        f"{account_text}"
+        f"До: <b>{account_guard_until}</b>"
     )
-
 
 async def build_text_async(kind: str) -> str:
     if kind == "status":
@@ -933,31 +957,25 @@ async def handle_callback(callback: CallbackQuery):
     if not await check_access_callback(callback):
         return
 
-    await callback.answer()
+    await callback.answer("⏳ Обрабатываю...")
 
     if callback.data not in BUTTONS:
         await safe_edit_message(callback, "Неизвестная команда.")
         return
 
-    if _callback_lock.locked():
-        await callback.answer("Подожди, предыдущий запрос еще обрабатывается.", show_alert=False)
-        return
-
-    async with _callback_lock:
-        try:
-            text = await build_text_async(callback.data)
-            await safe_edit_message(callback, text)
-        except Exception as error:
-            error_text = (
-                "❌ <b>Ошибка обработки кнопки.</b>\n\n"
-                f"<code>{str(error)}</code>"
-            )
-            await callback.message.answer(error_text, reply_markup=main_keyboard())
+    try:
+        text = await build_text_async(callback.data)
+        await safe_edit_message(callback, text)
+    except Exception as error:
+        error_text = (
+            "❌ <b>Ошибка обработки кнопки.</b>\n\n"
+            f"<code>{str(error)}</code>"
+        )
+        await callback.message.answer(error_text, reply_markup=main_keyboard())
 
 
 async def main():
     config = load_telegram_config()
-    settings = load_settings()
 
     if not config.get("enabled", False):
         print("Telegram bot disabled in config/telegram.json")
@@ -967,12 +985,6 @@ async def main():
 
     if not bot_token:
         print("Telegram bot token is empty")
-        return
-
-    symbol = settings.get("symbol", "XAUUSD")
-
-    if not ensure_mt5_connection(symbol=symbol, quiet=True):
-        print("MT5 connection failed or symbol check failed")
         return
 
     bot = Bot(

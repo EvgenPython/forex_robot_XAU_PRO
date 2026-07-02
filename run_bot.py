@@ -8,9 +8,7 @@ from app.telegram_bot import main as telegram_main
 
 
 LOOP_DELAY_SECONDS = 10
-
-telegram_started = False
-telegram_lock = threading.Lock()
+TELEGRAM_RESTART_DELAY_SECONDS = 30
 
 
 def run_trading_loop():
@@ -37,34 +35,37 @@ def run_trading_loop():
         time.sleep(LOOP_DELAY_SECONDS)
 
 
-def run_telegram_bot_once():
-    global telegram_started
+def run_telegram_bot_forever():
+    while True:
+        try:
+            print("=" * 60)
+            print("TELEGRAM BOT STARTING")
+            print("=" * 60)
 
-    with telegram_lock:
-        if telegram_started:
-            print("Telegram bot already started. Skipping second start.")
-            return
+            asyncio.run(telegram_main())
 
-        telegram_started = True
+            print()
+            print("=" * 60)
+            print("TELEGRAM BOT STOPPED")
+            print("=" * 60)
 
-    try:
-        print("=" * 60)
-        print("TELEGRAM BOT STARTING")
-        print("=" * 60)
+        except Exception:
+            print()
+            print("=" * 60)
+            print("TELEGRAM BOT ERROR")
+            print("=" * 60)
+            traceback.print_exc()
 
-        asyncio.run(telegram_main())
-
-    except Exception:
-        print()
-        print("=" * 60)
-        print("TELEGRAM BOT ERROR")
-        print("=" * 60)
-        traceback.print_exc()
+        print(
+            f"Telegram bot will restart in "
+            f"{TELEGRAM_RESTART_DELAY_SECONDS} seconds..."
+        )
+        time.sleep(TELEGRAM_RESTART_DELAY_SECONDS)
 
 
 def run_forever():
     telegram_thread = threading.Thread(
-        target=run_telegram_bot_once,
+        target=run_telegram_bot_forever,
         daemon=True,
     )
     telegram_thread.start()

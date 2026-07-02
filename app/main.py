@@ -1,9 +1,12 @@
 import json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
-
 from app.mt5_client import (
     ensure_mt5_connection,
     get_account_info,
+    get_closed_deals_from_history,
+    get_tick,
 )
 
 from app.data_loader import load_market_data
@@ -72,6 +75,69 @@ def safe_notify_error(error_text: str):
         log_event(f"Telegram error notification failed: {error}")
 
 
+STATS_TIMEZONE = ZoneInfo("Europe/Kyiv")
+
+
+def get_today_closed_profit(symbol: str) -> float:
+    now = datetime.now(STATS_TIMEZONE)
+    today = now.date()
+
+    # Берем историю с запасом, чтобы покрыть сделки, открытые перед выходными.
+    # Потом все равно фильтруем только закрытия сегодняшнего дня в Europe/Kyiv.
+    date_from = (now - timedelta(days=5)).replace(tzinfo=None)
+    date_to = (now + timedelta(minutes=1)).replace(tzinfo=None)
+
+    closed_deals = get_closed_deals_from_history(
+        date_from=date_from,
+        date_to=date_to,
+        symbol=symbol,
+    )
+
+    total = 0.0
+
+    for deal in closed_deals:
+        deal_time = deal.get("time")
+        if deal_time is None:
+            continue
+
+        deal_time = deal_time.replace(tzinfo=ZoneInfo("UTC")).astimezone(STATS_TIMEZONE)
+
+        if deal_time.date() == today:
+            total += float(deal.get("net_profit", 0.0))
+
+    return total
+
+def update_active_trade_cache(symbol: str, account):
+    state = load_state()
+    trade = state.get("active_trade")
+
+    if not trade:
+        return
+
+    tick = get_tick(symbol)
+    direction = str(trade.get("direction", "")).upper()
+    current_price = None
+
+    if tick is not None:
+        if direction == "BUY":
+            current_price = float(tick.bid)
+        elif direction == "SELL":
+            current_price = float(tick.ask)
+
+    balance = float(account.balance) if account is not None else 0.0
+    floating_profit = float(account.profit) if account is not None else 0.0
+    floating_percent = (floating_profit / balance * 100) if balance > 0 else 0.0
+
+    trade["current_price"] = round(current_price, 2) if current_price is not None else None
+    trade["floating_profit"] = round(floating_profit, 2)
+    trade["floating_percent"] = round(floating_percent, 2)
+    trade["cache_updated_at"] = datetime.now(STATS_TIMEZONE).isoformat(timespec="seconds")
+
+    state["active_trade"] = trade
+    save_state(state)
+
+
+
 def main():
     try:
         settings = load_settings()
@@ -97,9 +163,13 @@ def main():
             safe_notify_error("Account info not available")
             return
 
+        daily_closed_profit = get_today_closed_profit(symbol)
+
         daily_guard = update_daily_guard(
             account_balance=float(account.balance),
             account_equity=float(account.equity),
+            account_profit=float(account.profit),
+            daily_closed_profit=daily_closed_profit,
             soft_stop_percent=daily_soft_stop_percent,
             hard_stop_percent=daily_hard_stop_percent,
         )
@@ -158,16 +228,27 @@ def main():
 
         real_position_exists = has_open_position(symbol)
 
+        if active_trade is not None or real_position_exists:
+            update_active_trade_cache(symbol, account)
+
         if is_hard_stop_triggered(daily_guard):
             log_event("Daily hard stop is active")
 
-            try:
-                notify_daily_guard(
-                    drawdown_percent=float(daily_guard.get("drawdown_percent", 0.0)),
-                    stop_type="HARD STOP",
-                )
-            except Exception as error:
-                log_event(f"Telegram daily hard stop notification failed: {error}")
+            if not daily_guard.get("notification_sent", False):
+                try:
+                    notify_daily_guard(
+                        drawdown_percent=float(daily_guard.get("drawdown_percent", 0.0)),
+                        stop_type="HARD STOP",
+                    )
+
+                    daily_guard["notification_sent"] = True
+
+                    state = load_state()
+                    state["daily_guard"] = daily_guard
+                    save_state(state)
+
+                except Exception as error:
+                    log_event(f"Telegram daily hard stop notification failed: {error}")
 
             if dry_run:
                 if active_trade is not None:
@@ -201,13 +282,21 @@ def main():
             save_last_m15_candle(current_candle_time)
             log_event("Daily soft stop is active. New trades are blocked.")
 
-            try:
-                notify_daily_guard(
-                    drawdown_percent=float(daily_guard.get("drawdown_percent", 0.0)),
-                    stop_type="SOFT STOP",
-                )
-            except Exception as error:
-                log_event(f"Telegram daily soft stop notification failed: {error}")
+            if not daily_guard.get("notification_sent", False):
+                try:
+                    notify_daily_guard(
+                        drawdown_percent=float(daily_guard.get("drawdown_percent", 0.0)),
+                        stop_type="SOFT STOP",
+                    )
+
+                    daily_guard["notification_sent"] = True
+
+                    state = load_state()
+                    state["daily_guard"] = daily_guard
+                    save_state(state)
+
+                except Exception as error:
+                    log_event(f"Telegram daily soft stop notification failed: {error}")
 
             return
 
@@ -288,6 +377,10 @@ def main():
             "open_time": current_candle_time,
             "last_managed_m15_candle": current_candle_time,
             "dry_run": dry_run,
+            "current_price": None,
+            "floating_profit": 0.0,
+            "floating_percent": 0.0,
+            "cache_updated_at": None,
         }
 
         save_trade(trade_data)
