@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -18,10 +18,20 @@ from app.mt5_client import (
     get_symbol_info,
     get_tick,
     get_closed_deals_from_history,
+    load_accounts_config,
 )
 
+from app.health_manager import load_heartbeat
 from app.state_manager import load_state
 from app.telegram_notifier import load_telegram_config
+from app.text_ru import (
+    translate_direction,
+    translate_mode,
+    translate_mt5_issue,
+    translate_safety_reason,
+    translate_signal_reasons,
+    translate_stop_type,
+)
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_FILE = ROOT_DIR / "config" / "strategy_settings.json"
@@ -29,6 +39,17 @@ SETTINGS_FILE = ROOT_DIR / "config" / "strategy_settings.json"
 BUTTONS = {"status", "trade", "last_signal", "server", "robot", "stats", "efficiency"}
 STATS_TIMEZONE = ZoneInfo("Europe/Kyiv")
 _callback_lock = asyncio.Lock()
+_telegram_update_callback: Optional[Callable[[], None]] = None
+
+
+def mark_telegram_update_activity() -> None:
+    callback = _telegram_update_callback
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception as error:
+        print(f"Ошибка отметки активности Telegram: {error}")
 
 
 def load_settings() -> dict:
@@ -88,26 +109,32 @@ def format_price(value: float) -> str:
 
 
 def format_direction(direction: str) -> str:
-    direction = str(direction).upper()
-    if direction == "BUY":
-        return "🔺 BUY"
-    if direction == "SELL":
-        return "🔻 SELL"
-    return direction or "нет данных"
+    normalized = str(direction).upper()
+    translated = translate_direction(normalized)
+    if normalized == "BUY":
+        return f"🔺 {translated}"
+    if normalized == "SELL":
+        return f"🔻 {translated}"
+    return translated
 
 
-def format_mode(dry_run: bool, account_data: dict | None = None) -> str:
-    if dry_run:
-        return "⚪ DRY RUN"
+def get_configured_server() -> str:
+    try:
+        return str(load_accounts_config().get("server", ""))
+    except Exception:
+        return ""
 
-    server = ""
+
+def format_mode(account_data: dict | None = None, server: str | None = None) -> str:
+    server_name = str(server or "")
+
     if account_data is not None:
-        server = str(account_data.get("server", ""))
+        server_name = str(account_data.get("server", server_name))
 
-    if "demo" in server.lower():
-        return "🟡 DEMO"
+    if not server_name:
+        server_name = get_configured_server()
 
-    return "🟢 REAL"
+    return translate_mode(server_name)
 
 
 def format_short_time(value: Any) -> str:
@@ -270,8 +297,7 @@ def build_status_text() -> str:
     state = load_state()
 
     symbol = settings.get("symbol", "XAUUSD")
-    dry_run = bool(settings.get("dry_run", True))
-    mode = format_mode(dry_run=dry_run, account_data=None)
+    mode = format_mode()
 
     daily_guard = state.get("daily_guard") or {}
     active_trade = state.get("active_trade")
@@ -286,6 +312,18 @@ def build_status_text() -> str:
     daily_result_money = parse_float(daily_guard.get("daily_result", 0.0))
     drawdown_percent = parse_float(daily_guard.get("drawdown_percent", 0.0))
     trading_blocked = bool(daily_guard.get("trading_blocked", False))
+    safety = state.get("safety") or {}
+    safety_blocked = bool(safety.get("blocked", False))
+    pending_open = state.get("pending_open")
+    account_guard = state.get("account_guard") or {}
+    account_guard_blocked = bool(account_guard.get("blocked", False))
+    new_trades_blocked = (
+        trading_blocked
+        or account_guard_blocked
+        or safety_blocked
+        or pending_open is not None
+    )
+    safety_status = "🔴 Заблокировано" if safety_blocked else "🟢 Норма"
 
     start_balance = parse_float(daily_guard.get("start_balance", balance))
 
@@ -307,7 +345,8 @@ def build_status_text() -> str:
         f"{day_icon} Дневной результат: <b>{format_money(daily_result_money)} / {format_percent(daily_result_percent)}</b>\n"
         f"Дневная просадка: <b>{drawdown_percent:.2f}%</b>\n\n"
         f"Открытая сделка: <b>{trade_status}</b>\n"
-        f"Новые сделки запрещены: <b>{format_bool(trading_blocked)}</b>"
+        f"Защита состояния: <b>{safety_status}</b>\n"
+        f"Новые сделки запрещены: <b>{format_bool(new_trades_blocked)}</b>"
     )
 
 def build_trade_text() -> str:
@@ -326,15 +365,13 @@ def build_trade_text() -> str:
     tp3 = float(trade.get("tp3", 0))
     volume = float(trade.get("volume", 0))
     score = trade.get("score", "")
-    dry_run = bool(trade.get("dry_run", True))
-
     tp1_hit = bool(trade.get("tp1_hit", False))
     tp2_hit = bool(trade.get("tp2_hit", False))
     tp3_hit = bool(trade.get("tp3_hit", False))
     breakeven_active = bool(trade.get("breakeven_active", False))
     candles_in_trade = int(trade.get("candles_in_trade", 0))
 
-    mode = format_mode(dry_run=dry_run, account_data=None)
+    mode = format_mode(server=trade.get("server"))
 
     current_price = trade.get("current_price")
     floating_profit = parse_float(trade.get("floating_profit", 0.0))
@@ -349,7 +386,7 @@ def build_trade_text() -> str:
             f"Обновлено: <b>{cache_updated_at}</b>"
         )
     else:
-        result_text = "Текущий результат: <b>ожидает обновления state.json</b>"
+        result_text = "Текущий результат: <b>ожидает обновления файла состояния</b>"
 
     return (
         "💼 <b>Открытая сделка</b>\n\n"
@@ -359,12 +396,12 @@ def build_trade_text() -> str:
         f"Оценка: <b>{score}</b>\n\n"
         f"Вход: <b>{entry_price:.2f}</b>\n"
         f"Стоп: <b>{stop_loss:.2f}</b>\n\n"
-        f"{'✅' if tp1_hit else '❌'} TP1: <b>{tp1:.2f}</b>\n"
-        f"{'✅' if tp2_hit else '❌'} TP2: <b>{tp2:.2f}</b>\n"
-        f"{'✅' if tp3_hit else '❌'} TP3: <b>{tp3:.2f}</b>\n\n"
+        f"{'✅' if tp1_hit else '❌'} Цель 1: <b>{tp1:.2f}</b>\n"
+        f"{'✅' if tp2_hit else '❌'} Цель 2: <b>{tp2:.2f}</b>\n"
+        f"{'✅' if tp3_hit else '❌'} Цель 3: <b>{tp3:.2f}</b>\n\n"
         f"Объём: <b>{volume}</b>\n"
         f"Свечей в сделке: <b>{candles_in_trade}</b>\n"
-        f"BE+ активен: <b>{format_bool(breakeven_active)}</b>\n\n"
+        f"Безубыток+ активен: <b>{format_bool(breakeven_active)}</b>\n\n"
         f"{result_text}"
     )
 
@@ -388,8 +425,8 @@ def load_closed_deals_from_mt5() -> list[dict]:
     symbol = settings.get("symbol", "XAUUSD")
     periods = get_stats_periods()
 
-    date_from = periods["month"].replace(tzinfo=None)
-    date_to = periods["to"].replace(tzinfo=None)
+    date_from = periods["month"].astimezone(timezone.utc)
+    date_to = periods["to"].astimezone(timezone.utc)
 
     return get_closed_deals_from_history(
         date_from=date_from,
@@ -461,9 +498,9 @@ def format_stats_block(title: str, stats: dict, base_balance: float) -> str:
         f"🟢 Прибыльных: <b>{stats['wins']}</b>\n"
         f"🔴 Убыточных: <b>{stats['losses']}</b>\n"
         f"⚪ Безубыток: <b>{stats['breakevens']}</b>\n"
-        f"Winrate: <b>{stats['winrate']:.2f}%</b>\n"
-        f"Profit Factor: <b>{pf_text}</b>\n"
-        f"{icon} P/L: <b>{format_money(money)} / {format_percent(percent)}</b>"
+        f"Доля прибыльных сделок: <b>{stats['winrate']:.2f}%</b>\n"
+        f"Профит-фактор: <b>{pf_text}</b>\n"
+        f"{icon} Результат: <b>{format_money(money)} / {format_percent(percent)}</b>"
     )
 
 
@@ -583,11 +620,11 @@ def build_efficiency_text() -> str:
     pf_text = format_profit_factor(metrics["profit_factor"])
 
     if metrics["buy_count"] == 0 and metrics["sell_count"] == 0 and metrics["total"] > 0:
-        direction_text = "BUY / SELL: <b>недоступно из истории MT5</b>"
+        direction_text = "Покупки / продажи: <b>недоступно из истории MT5</b>"
     else:
         direction_text = (
-            f"BUY: <b>{metrics['buy_count']}</b>\n"
-            f"SELL: <b>{metrics['sell_count']}</b>"
+            f"Покупки: <b>{metrics['buy_count']}</b>\n"
+            f"Продажи: <b>{metrics['sell_count']}</b>"
         )
 
     icon = "🟢" if metrics["money"] > 0 else "🔴" if metrics["money"] < 0 else "⚪"
@@ -601,9 +638,9 @@ def build_efficiency_text() -> str:
         f"🟢 Прибыльных: <b>{metrics['wins']}</b>\n"
         f"🔴 Убыточных: <b>{metrics['losses']}</b>\n"
         f"⚪ Безубыток: <b>{metrics['breakevens']}</b>\n\n"
-        f"Winrate: <b>{metrics['winrate']:.2f}%</b>\n"
-        f"Profit Factor: <b>{pf_text}</b>\n"
-        f"{icon} P/L: <b>{format_money(metrics['money'])}</b>\n\n"
+        f"Доля прибыльных сделок: <b>{metrics['winrate']:.2f}%</b>\n"
+        f"Профит-фактор: <b>{pf_text}</b>\n"
+        f"{icon} Результат: <b>{format_money(metrics['money'])}</b>\n\n"
         "━━━━━━━━━━━━━━\n\n"
         f"Средняя прибыль: <b>{format_money(metrics['avg_win'])}</b>\n"
         f"Средний убыток: <b>{format_money(metrics['avg_loss'])}</b>\n\n"
@@ -631,16 +668,15 @@ def read_last_signal_from_state() -> str | None:
     time_value = format_short_time(last_signal.get("time", "нет данных"))
 
     if action == "BUY":
-        decision = "BUY ⬆️"
+        decision = "ПОКУПКА ⬆️"
     elif action == "SELL":
-        decision = "SELL ⬇️"
+        decision = "ПРОДАЖА ⬇️"
     else:
-        decision = "WAIT"
+        decision = "ОЖИДАНИЕ"
 
-    if isinstance(reasons, list) and reasons:
-        reasons_text = "\n".join([f"• {reason}" for reason in reasons])
-    elif reasons:
-        reasons_text = f"• {reasons}"
+    translated_reasons = translate_signal_reasons(reasons)
+    if translated_reasons:
+        reasons_text = "\n".join([f"• {reason}" for reason in translated_reasons])
     else:
         reasons_text = "• Причины не указаны"
 
@@ -650,11 +686,11 @@ def read_last_signal_from_state() -> str | None:
         f"<b>{symbol}</b>\n\n"
         "Время:\n"
         f"<b>{time_value}</b>\n\n"
-        "🟢 BUY Score:\n"
+        "🟢 Оценка покупки:\n"
         f"<b>{buy_score}%</b>\n\n"
-        "🔴 SELL Score:\n"
+        "🔴 Оценка продажи:\n"
         f"<b>{sell_score}%</b>\n\n"
-        "Итоговый Score:\n"
+        "Итоговая оценка:\n"
         f"<b>{score}%</b>\n\n"
         "Решение:\n"
         f"<b>{decision}</b>\n\n"
@@ -671,7 +707,7 @@ def read_last_signal_from_log() -> str:
 
     return (
         "📜 <b>Последний сигнал</b>\n\n"
-        "Последний сигнал пока не сохранён в state.json."
+        "Последний сигнал пока не сохранён в файле состояния."
     )
 
 
@@ -720,7 +756,7 @@ def build_server_text() -> str:
         return (
             "🖥 <b>Сервер</b>\n\n"
             f"❌ Не удалось получить данные сервера.\n"
-            f"<code>{info.get('error', 'unknown error')}</code>"
+            f"<code>{info.get('error', 'неизвестная ошибка')}</code>"
         )
 
     cpu_text = f"{info['cpu_percent']:.1f}%" if info.get("cpu_percent") is not None else "недоступно"
@@ -732,13 +768,13 @@ def build_server_text() -> str:
             f"({info['ram_percent']:.1f}%)"
         )
     else:
-        ram_text = "недоступно, установи psutil"
+        ram_text = "недоступно; установи пакет psutil"
 
     return (
         "🖥 <b>Сервер</b>\n\n"
         f"Система: <b>{info['platform']}</b>\n\n"
-        f"CPU: <b>{cpu_text}</b>\n"
-        f"RAM: <b>{ram_text}</b>\n\n"
+        f"Процессор: <b>{cpu_text}</b>\n"
+        f"ОЗУ: <b>{ram_text}</b>\n\n"
         f"Диск всего: <b>{info['disk_total_gb']:.2f} GB</b>\n"
         f"Диск занято: <b>{info['disk_used_gb']:.2f} GB</b>\n"
         f"Диск свободно: <b>{info['disk_free_gb']:.2f} GB</b>"
@@ -750,8 +786,7 @@ def build_robot_text() -> str:
     state = load_state()
 
     symbol = settings.get("symbol", "XAUUSD")
-    dry_run = bool(settings.get("dry_run", True))
-    mode = format_mode(dry_run=dry_run, account_data=None)
+    mode = format_mode()
 
     min_score = settings.get("min_score", 75)
     max_score = settings.get("max_score", 90)
@@ -809,6 +844,59 @@ def build_robot_text() -> str:
 
     last_m15 = format_short_time(state.get("last_m15_candle", "нет данных"))
 
+    heartbeat = load_heartbeat()
+    telegram_status_raw = str(
+        heartbeat.get("telegram_polling_status") or "нет данных"
+    ).lower()
+    telegram_status_map = {
+        "running": "🟢 Работает",
+        "starting": "🟡 Запускается",
+        "configured": "🟡 Настраивается",
+        "restarting": "🟡 Перезапускается",
+        "error": "🔴 Ошибка",
+        "stopped": "🔴 Остановлен",
+        "disabled": "⚪ Отключён",
+        "not_configured": "⚪ Не настроен",
+    }
+    telegram_status = telegram_status_map.get(
+        telegram_status_raw,
+        telegram_status_raw or "нет данных",
+    )
+    telegram_heartbeat = format_short_time(
+        heartbeat.get("telegram_last_heartbeat_at", "нет данных")
+    )
+    telegram_errors = int(
+        heartbeat.get("telegram_consecutive_errors", 0) or 0
+    )
+
+    def health_flag(value, ok_text="🟢 Доступен", bad_text="🔴 Недоступен"):
+        if value is True:
+            return ok_text
+        if value is False:
+            return bad_text
+        return "⚪ Нет данных"
+
+    mt5_terminal_status = health_flag(heartbeat.get("terminal_available"))
+    mt5_account_status = health_flag(heartbeat.get("account_available"))
+    mt5_quotes_status = health_flag(heartbeat.get("quotes_available"))
+    mt5_trade_status = health_flag(
+        heartbeat.get("trade_allowed"),
+        ok_text="🟢 Разрешена",
+        bad_text="🔴 Отключена",
+    )
+    mt5_issue = translate_mt5_issue(heartbeat.get("mt5_issue_code"))
+
+    safety = state.get("safety") or {}
+    safety_blocked = bool(safety.get("blocked", False))
+    safety_reason = translate_safety_reason(safety.get("reason_code"))
+    safety_status = "🔴 Заблокировано" if safety_blocked else "🟢 Норма"
+    state_schema = state.get("state_schema_version", state.get("state_version", "—"))
+    robot_version = state.get("robot_version", "—")
+    strategy_context = state.get("strategy_context") or {}
+    config_hash = str(strategy_context.get("config_hash") or "—")
+    if config_hash != "—":
+        config_hash = config_hash[:12]
+
     return (
         "⚙️ <b>Робот</b>\n\n"
         f"Инструмент: <b>{symbol}</b>\n"
@@ -819,20 +907,45 @@ def build_robot_text() -> str:
 
         "━━━━━━━━━━━━━━\n\n"
 
-        "🛡 <b>Daily Guard</b>\n"
-        f"Soft Stop: <b>{soft_stop}%</b>\n"
-        f"Hard Stop: <b>{hard_stop}%</b>\n\n"
+        "🛡 <b>Дневная защита</b>\n"
+        f"Мягкий лимит: <b>{soft_stop}%</b>\n"
+        f"Жёсткий лимит: <b>{hard_stop}%</b>\n\n"
         f"Дневной результат: <b>{format_money(daily_result)}</b>\n"
         f"Просадка: <b>{drawdown_percent:.2f}%</b>\n"
         f"Статус: <b>{daily_guard_status}</b>\n\n"
 
         "━━━━━━━━━━━━━━\n\n"
 
-        "🛡 <b>Account Guard</b>\n"
+        "🛡 <b>Защита счёта</b>\n"
         f"Лимит: <b>{account_guard_percent}%</b>\n"
         f"Пауза: <b>{account_guard_pause_days} дней</b>\n"
         f"Статус: <b>{account_guard_status}</b>\n"
-        f"До: <b>{account_guard_until}</b>"
+        f"До: <b>{account_guard_until}</b>\n\n"
+
+        "━━━━━━━━━━━━━━\n\n"
+
+        "🖥 <b>Состояние MT5</b>\n"
+        f"Терминал: <b>{mt5_terminal_status}</b>\n"
+        f"Счёт: <b>{mt5_account_status}</b>\n"
+        f"Котировки: <b>{mt5_quotes_status}</b>\n"
+        f"Торговля: <b>{mt5_trade_status}</b>\n"
+        f"Проблема: <b>{mt5_issue}</b>\n\n"
+
+        "━━━━━━━━━━━━━━\n\n"
+
+        "📡 <b>Получение команд Telegram</b>\n"
+        f"Статус: <b>{telegram_status}</b>\n"
+        f"Последняя проверка: <b>{telegram_heartbeat}</b>\n"
+        f"Ошибок подряд: <b>{telegram_errors}</b>\n\n"
+
+        "━━━━━━━━━━━━━━\n\n"
+
+        "🧩 <b>Защита состояния</b>\n"
+        f"Статус: <b>{safety_status}</b>\n"
+        f"Причина: <b>{safety_reason}</b>\n"
+        f"Версия структуры: <b>{state_schema}</b>\n"
+        f"Версия робота: <b>{robot_version}</b>\n"
+        f"Хеш настроек: <code>{config_hash}</code>"
     )
 
 async def build_text_async(kind: str) -> str:
@@ -871,6 +984,7 @@ async def send_menu(message: Message):
 
 
 async def check_access_message(message: Message) -> bool:
+    mark_telegram_update_activity()
     config = load_telegram_config()
 
     if not is_allowed(message.chat.id, config):
@@ -881,6 +995,7 @@ async def check_access_message(message: Message) -> bool:
 
 
 async def check_access_callback(callback: CallbackQuery) -> bool:
+    mark_telegram_update_activity()
     config = load_telegram_config()
 
     if not is_allowed(callback.message.chat.id, config):
@@ -974,18 +1089,44 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.answer(error_text, reply_markup=main_keyboard())
 
 
-async def main():
+async def _polling_health_pulse(
+    callback: Optional[Callable[[], None]],
+    interval_seconds: int,
+) -> None:
+    if callback is None:
+        return
+
+    interval = max(5, int(interval_seconds))
+    while True:
+        # Первый pulse приходит только после устойчивой работы polling в течение
+        # interval. Это не позволяет мгновенному TelegramConflictError каждый
+        # раз обнулять счётчик последовательных ошибок.
+        await asyncio.sleep(interval)
+        try:
+            callback()
+        except Exception as error:
+            print(f"Ошибка обновления состояния Telegram: {error}")
+
+
+async def main(
+    on_polling_started: Optional[Callable[[], None]] = None,
+    on_polling_heartbeat: Optional[Callable[[], None]] = None,
+    on_update: Optional[Callable[[], None]] = None,
+    heartbeat_interval_seconds: int = 15,
+) -> None:
+    global _telegram_update_callback
+
     config = load_telegram_config()
 
     if not config.get("enabled", False):
-        print("Telegram bot disabled in config/telegram.json")
-        return
+        raise RuntimeError("Telegram-бот отключён в config/telegram.json")
 
     bot_token = config.get("bot_token", "")
 
     if not bot_token:
-        print("Telegram bot token is empty")
-        return
+        raise RuntimeError("Токен Telegram-бота не указан")
+
+    _telegram_update_callback = on_update
 
     bot = Bot(
         token=bot_token,
@@ -1008,8 +1149,38 @@ async def main():
         F.data.in_(BUTTONS),
     )
 
-    print("Telegram bot started")
-    await dp.start_polling(bot)
+    pulse_task: asyncio.Task | None = None
+
+    try:
+        # Явная проверка токена и доступности Telegram API до объявления
+        # polling здоровым. Если getMe не проходит, run_bot перезапустит polling.
+        await bot.get_me()
+
+        if on_polling_started is not None:
+            on_polling_started()
+
+        pulse_task = asyncio.create_task(
+            _polling_health_pulse(
+                on_polling_heartbeat,
+                heartbeat_interval_seconds,
+            ),
+            name="telegram-health-pulse",
+        )
+
+        print("Telegram-бот запущен")
+        await dp.start_polling(bot)
+    finally:
+        if pulse_task is not None:
+            pulse_task.cancel()
+            try:
+                await pulse_task
+            except asyncio.CancelledError:
+                pass
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
+        _telegram_update_callback = None
 
 
 if __name__ == "__main__":

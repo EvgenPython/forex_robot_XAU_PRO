@@ -1,5 +1,7 @@
-import pandas as pd
 import MetaTrader5 as mt5
+import pandas as pd
+
+from app.mt5_client import get_last_error, get_rates_from_pos
 
 
 TIMEFRAME_MAP = {
@@ -9,43 +11,23 @@ TIMEFRAME_MAP = {
 }
 
 
-def get_rates(symbol: str, timeframe: str, bars: int = 500) -> pd.DataFrame:
-    if timeframe not in TIMEFRAME_MAP:
-        raise ValueError(f"Unsupported timeframe: {timeframe}")
+def load_rates(symbol: str, timeframe_name: str, count: int = 500) -> pd.DataFrame:
+    timeframe = TIMEFRAME_MAP[timeframe_name]
+    rates = get_rates_from_pos(symbol, timeframe, 0, count)
 
-    rates = mt5.copy_rates_from_pos(
-        symbol,
-        TIMEFRAME_MAP[timeframe],
-        0,
-        bars,
-    )
+    if rates is None or len(rates) == 0:
+        raise RuntimeError(
+            f"MT5 не вернул свечи для {symbol} {timeframe_name}: {get_last_error()}"
+        )
 
-    if rates is None:
-        raise RuntimeError(f"MT5 returned no rates for {symbol} {timeframe}: {mt5.last_error()}")
-
-    if len(rates) == 0:
-        raise RuntimeError(f"No candles loaded for {symbol} {timeframe}")
-
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-
-    return df
+    dataframe = pd.DataFrame(rates)
+    dataframe["time"] = pd.to_datetime(dataframe["time"], unit="s", utc=True)
+    return dataframe
 
 
-def load_market_data(symbol: str) -> dict:
-    h4 = get_rates(symbol=symbol, timeframe="H4", bars=500)
-    h1 = get_rates(symbol=symbol, timeframe="H1", bars=500)
-    m15 = get_rates(symbol=symbol, timeframe="M15", bars=500)
-
-    print("=" * 50)
-    print("MARKET DATA LOADED")
-    print(f"{symbol} H4 candles: {len(h4)} | last: {h4.iloc[-1]['time']}")
-    print(f"{symbol} H1 candles: {len(h1)} | last: {h1.iloc[-1]['time']}")
-    print(f"{symbol} M15 candles: {len(m15)} | last: {m15.iloc[-1]['time']}")
-    print("=" * 50)
-
+def load_market_data(symbol: str) -> dict[str, pd.DataFrame]:
     return {
-        "h4": h4,
-        "h1": h1,
-        "m15": m15,
+        "h4": load_rates(symbol, "H4"),
+        "h1": load_rates(symbol, "H1"),
+        "m15": load_rates(symbol, "M15"),
     }

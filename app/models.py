@@ -86,3 +86,47 @@ class Trade:
         self.rr = rr
         self.close_reason = close_reason
         self.is_closed = True
+
+class CycleStatus(Enum):
+    SUCCESS = "SUCCESS"
+    MT5_UNAVAILABLE = "MT5_UNAVAILABLE"
+    TERMINAL_UNAVAILABLE = "TERMINAL_UNAVAILABLE"
+    ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
+    QUOTES_UNAVAILABLE = "QUOTES_UNAVAILABLE"
+    ACCOUNT_CONTEXT_MISMATCH = "ACCOUNT_CONTEXT_MISMATCH"
+    STATE_SAFETY_BLOCKED = "STATE_SAFETY_BLOCKED"
+    STATE_RECOVERED = "STATE_RECOVERED"
+    TRADE_DISABLED = "TRADE_DISABLED"
+    ACCOUNT_GUARD_BLOCKED = "ACCOUNT_GUARD_BLOCKED"
+    DAILY_HARD_STOP = "DAILY_HARD_STOP"
+    DAILY_SOFT_STOP = "DAILY_SOFT_STOP"
+    POSITION_MANAGED = "POSITION_MANAGED"
+    POSITION_RECONCILING = "POSITION_RECONCILING"
+    POSITION_WITHOUT_STATE = "POSITION_WITHOUT_STATE"
+    PENDING_OPEN = "PENDING_OPEN"
+    PENDING_OPEN_RECOVERED = "PENDING_OPEN_RECOVERED"
+    NO_NEW_CANDLE = "NO_NEW_CANDLE"
+    WAIT_SIGNAL = "WAIT_SIGNAL"
+    TRADE_OPENED = "TRADE_OPENED"
+    SIGNAL_REJECTED = "SIGNAL_REJECTED"
+    EXECUTION_ANOMALY = "EXECUTION_ANOMALY"
+
+
+@dataclass
+class CycleResult:
+    status: CycleStatus
+    healthy: bool = True
+    mt5_available: bool = True
+    terminal_available: bool = True
+    account_available: bool = True
+    quotes_available: bool = True
+    trade_allowed: bool = True
+    mt5_issue_code: Optional[str] = None
+    message: str = ""
+    account_login: Optional[int] = None
+    server: Optional[str] = None
+
+    @property
+    def status_value(self) -> str:
+        return self.status.value
+

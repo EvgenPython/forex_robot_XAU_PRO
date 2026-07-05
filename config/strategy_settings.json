@@ -1,11 +1,10 @@
 {
   "symbol": "XAUUSD",
   "risk_percent": 1.0,
-  "dry_run": true,
   "min_score": 75,
   "max_score": 90,
   "max_stop_atr": 2.0,
-  "breakeven_offset": 0.10,
+  "breakeven_offset": 0.1,
   "ema": {
     "fast_period": 50,
     "slow_period": 200

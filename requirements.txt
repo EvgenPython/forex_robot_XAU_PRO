@@ -1,9 +1,7 @@
 MetaTrader5
 pandas
-numpy
 ta
+aiogram>=3,<4
 requests
-python-dotenv
-pytz
-aiogram
 psutil
+tzdata

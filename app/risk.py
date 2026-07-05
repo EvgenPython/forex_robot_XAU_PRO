@@ -1,5 +1,6 @@
 import math
-import MetaTrader5 as mt5
+
+from app.mt5_client import get_symbol_info
 
 
 def calculate_tp(
@@ -16,7 +17,7 @@ def calculate_tp(
     if direction == "SELL":
         return entry_price - risk * rr_multiplier
 
-    raise ValueError(f"Unknown direction: {direction}")
+    raise ValueError(f"Неизвестное направление: {direction}")
 
 
 def calculate_rr(
@@ -36,7 +37,7 @@ def calculate_rr(
     if direction == "SELL":
         return (entry_price - close_price) / risk
 
-    raise ValueError(f"Unknown direction: {direction}")
+    raise ValueError(f"Неизвестное направление: {direction}")
 
 
 def calculate_result_percent(rr: float, risk_percent: float) -> float:
@@ -67,11 +68,10 @@ def calculate_position_size(
     symbol: str,
 ) -> float:
     """
-    Calculates position size by fixed account risk.
+    Рассчитывает объём позиции по фиксированному риску счёта.
 
-    Important:
-    If calculated volume is below broker minimum lot,
-    the function returns 0.0 instead of increasing risk.
+    Если рассчитанный объём меньше минимального лота брокера,
+    функция возвращает 0.0 и не увеличивает риск.
     """
 
     if balance <= 0:
@@ -87,10 +87,10 @@ def calculate_position_size(
 
     risk_amount = balance * (risk_percent / 100)
 
-    symbol_info = mt5.symbol_info(symbol)
+    symbol_info = get_symbol_info(symbol)
 
     if symbol_info is None:
-        raise RuntimeError(f"Cannot get symbol info for {symbol}")
+        raise RuntimeError(f"Не удалось получить данные инструмента {symbol}")
 
     tick_size = float(symbol_info.trade_tick_size)
     tick_value = float(symbol_info.trade_tick_value)
@@ -100,19 +100,19 @@ def calculate_position_size(
     volume_max = float(symbol_info.volume_max)
 
     if tick_size <= 0:
-        raise RuntimeError(f"Invalid tick_size for {symbol}")
+        raise RuntimeError(f"Некорректный размер тика для {symbol}")
 
     if tick_value <= 0:
-        raise RuntimeError(f"Invalid tick_value for {symbol}")
+        raise RuntimeError(f"Некорректная стоимость тика для {symbol}")
 
     if volume_min <= 0:
-        raise RuntimeError(f"Invalid volume_min for {symbol}")
+        raise RuntimeError(f"Некорректный минимальный объём для {symbol}")
 
     if volume_step <= 0:
-        raise RuntimeError(f"Invalid volume_step for {symbol}")
+        raise RuntimeError(f"Некорректный шаг объёма для {symbol}")
 
     if volume_max <= 0:
-        raise RuntimeError(f"Invalid volume_max for {symbol}")
+        raise RuntimeError(f"Некорректный максимальный объём для {symbol}")
 
     money_loss_per_lot = (stop_distance / tick_size) * tick_value
 
